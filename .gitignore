@@ -1,0 +1,28 @@
+.claude
+__pycache__/
+.DS_Store
+
+*/*/*.whl
+vendor/*
+
+# Accidental rsync artifact: a bad relative destination produced
+# develope/thesis/out_synthesis_train/... nested inside the repo. Real outputs
+# belong in ../out_synthesis_train/.
+develope/
+
+# Patch-grid previews. Every real run writes its own <run>/patch_grids/; these
+# only land at the repo root when dataset.py is driven without an out_dir.
+/patch_grids/
+
+*.nii.gz
+*.npz
+*.pth
+
+# XGBoost phase-model weights are large and mostly derived — but
+# orgFeatXGB_CTPhase/xgb_vindr_full.pkl is a REQUIRED input to benchmark.py,
+# so it is force-added and re-included here.
+*.pkl
+!orgFeatXGB_CTPhase/xgb_vindr_full.pkl
+
+# Recurring rsync artifact: a relative destination clones the repo into itself.
+synthetic_CECT/

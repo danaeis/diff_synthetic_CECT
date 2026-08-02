@@ -1,0 +1,25 @@
+# literature_baseline — pinned to what was confirmed installed/working on the
+# training server this session (torch cu124 build; see IMPLEMENTATION.md §3
+# for what each DINO-loader tier actually needs).
+#
+# Install core deps with:
+#   pip install -r requirements.txt
+#
+# torch/torchvision are listed unpinned-build here since the correct wheel
+# (cpu/cu121/cu124/...) depends on the machine's CUDA driver — install those
+# first from https://pytorch.org/get-started/locally/ for your platform, then
+# install the rest of this file.
+
+torch>=2.6
+torchvision>=0.21      # PerceptualLoss (VGG16 IMAGENET1K_V1 weights)
+nibabel>=5.3            # .nii.gz volume I/O
+numpy>=2.2
+pandas>=2.3              # labels.csv phase lookup
+matplotlib>=3.10         # patch grids / sample grids / loss curves
+tqdm>=4.67
+
+# Optional — only needed if perceptual_backbone='dino' or saliency_mode='dino':
+timm>=1.0.22             # tier 2/3 DINO loader (DINOv3-if-available, else DINOv2)
+# transformers>=4.0      # tier 1 loader only (real DINOv3, gated HF license
+                          # required); NOT installed in the environment
+                          # checked this session — uncomment if you set it up.

@@ -1,0 +1,335 @@
+{
+  "n_cases": 410,
+  "n_studies": 137,
+  "feature_sources": {
+    "mask": 410
+  },
+  "oof_accuracy": 0.9707317073170731,
+  "oof_confusion": [
+    [
+      137,
+      0,
+      0
+    ],
+    [
+      0,
+      130,
+      6
+    ],
+    [
+      1,
+      5,
+      131
+    ]
+  ],
+  "oof_report": {
+    "non-contrast": {
+      "precision": 0.9927536231884058,
+      "recall": 1.0,
+      "f1-score": 0.9963636363636363,
+      "support": 137.0
+    },
+    "arterial": {
+      "precision": 0.9629629629629629,
+      "recall": 0.9558823529411765,
+      "f1-score": 0.959409594095941,
+      "support": 136.0
+    },
+    "venous": {
+      "precision": 0.9562043795620438,
+      "recall": 0.9562043795620438,
+      "f1-score": 0.9562043795620438,
+      "support": 137.0
+    },
+    "accuracy": 0.9707317073170731,
+    "macro avg": {
+      "precision": 0.9706403219044709,
+      "recall": 0.9706955775010734,
+      "f1-score": 0.9706592033405403,
+      "support": 410.0
+    },
+    "weighted avg": {
+      "precision": 0.9706590471701818,
+      "recall": 0.9707317073170731,
+      "f1-score": 0.9706866414118686,
+      "support": 410.0
+    }
+  },
+  "fold_reports": [
+    {
+      "0": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 28.0
+      },
+      "1": {
+        "precision": 0.9333333333333333,
+        "recall": 1.0,
+        "f1-score": 0.9655172413793104,
+        "support": 28.0
+      },
+      "2": {
+        "precision": 1.0,
+        "recall": 0.9285714285714286,
+        "f1-score": 0.9629629629629629,
+        "support": 28.0
+      },
+      "accuracy": 0.9761904761904762,
+      "macro avg": {
+        "precision": 0.9777777777777779,
+        "recall": 0.9761904761904763,
+        "f1-score": 0.9761600681140911,
+        "support": 84.0
+      },
+      "weighted avg": {
+        "precision": 0.9777777777777776,
+        "recall": 0.9761904761904762,
+        "f1-score": 0.9761600681140912,
+        "support": 84.0
+      }
+    },
+    {
+      "0": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 28.0
+      },
+      "1": {
+        "precision": 0.9629629629629629,
+        "recall": 0.9285714285714286,
+        "f1-score": 0.9454545454545454,
+        "support": 28.0
+      },
+      "2": {
+        "precision": 0.9310344827586207,
+        "recall": 0.9642857142857143,
+        "f1-score": 0.9473684210526315,
+        "support": 28.0
+      },
+      "accuracy": 0.9642857142857143,
+      "macro avg": {
+        "precision": 0.9646658152405277,
+        "recall": 0.9642857142857143,
+        "f1-score": 0.964274322169059,
+        "support": 84.0
+      },
+      "weighted avg": {
+        "precision": 0.9646658152405279,
+        "recall": 0.9642857142857143,
+        "f1-score": 0.964274322169059,
+        "support": 84.0
+      }
+    },
+    {
+      "0": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 27.0
+      },
+      "1": {
+        "precision": 0.9615384615384616,
+        "recall": 0.9259259259259259,
+        "f1-score": 0.9433962264150944,
+        "support": 27.0
+      },
+      "2": {
+        "precision": 0.9285714285714286,
+        "recall": 0.9629629629629629,
+        "f1-score": 0.9454545454545454,
+        "support": 27.0
+      },
+      "accuracy": 0.9629629629629629,
+      "macro avg": {
+        "precision": 0.9633699633699635,
+        "recall": 0.9629629629629629,
+        "f1-score": 0.9629502572898799,
+        "support": 81.0
+      },
+      "weighted avg": {
+        "precision": 0.9633699633699634,
+        "recall": 0.9629629629629629,
+        "f1-score": 0.96295025728988,
+        "support": 81.0
+      }
+    },
+    {
+      "0": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1-score": 1.0,
+        "support": 27.0
+      },
+      "1": {
+        "precision": 1.0,
+        "recall": 0.9615384615384616,
+        "f1-score": 0.9803921568627451,
+        "support": 26.0
+      },
+      "2": {
+        "precision": 0.9642857142857143,
+        "recall": 1.0,
+        "f1-score": 0.9818181818181818,
+        "support": 27.0
+      },
+      "accuracy": 0.9875,
+      "macro avg": {
+        "precision": 0.9880952380952381,
+        "recall": 0.9871794871794872,
+        "f1-score": 0.9874034462269757,
+        "support": 80.0
+      },
+      "weighted avg": {
+        "precision": 0.9879464285714284,
+        "recall": 0.9875,
+        "f1-score": 0.9874910873440286,
+        "support": 80.0
+      }
+    },
+    {
+      "0": {
+        "precision": 0.9642857142857143,
+        "recall": 1.0,
+        "f1-score": 0.9818181818181818,
+        "support": 27.0
+      },
+      "1": {
+        "precision": 0.9629629629629629,
+        "recall": 0.9629629629629629,
+        "f1-score": 0.9629629629629629,
+        "support": 27.0
+      },
+      "2": {
+        "precision": 0.9615384615384616,
+        "recall": 0.9259259259259259,
+        "f1-score": 0.9433962264150944,
+        "support": 27.0
+      },
+      "accuracy": 0.9629629629629629,
+      "macro avg": {
+        "precision": 0.9629290462623796,
+        "recall": 0.9629629629629629,
+        "f1-score": 0.9627257903987463,
+        "support": 81.0
+      },
+      "weighted avg": {
+        "precision": 0.9629290462623795,
+        "recall": 0.9629629629629629,
+        "f1-score": 0.9627257903987463,
+        "support": 81.0
+      }
+    }
+  ],
+  "organs": [
+    "liver",
+    "pancreas",
+    "urinary_bladder",
+    "gallbladder",
+    "heart",
+    "aorta",
+    "inferior_vena_cava",
+    "portal_vein_and_splenic_vein",
+    "iliac_vena_left",
+    "iliac_vena_right",
+    "iliac_artery_left",
+    "iliac_artery_right",
+    "pulmonary_vein",
+    "brain",
+    "colon",
+    "small_bowel"
+  ],
+  "organ_importance": {
+    "liver": 0.29036760330200195,
+    "pancreas": 0.03707133233547211,
+    "urinary_bladder": 0.018714066594839096,
+    "gallbladder": 0.00842408649623394,
+    "heart": 0.23499326407909393,
+    "aorta": 0.29270583391189575,
+    "inferior_vena_cava": 0.028812717646360397,
+    "portal_vein_and_splenic_vein": 0.02341216430068016,
+    "iliac_vena_left": 0.002879323437809944,
+    "iliac_vena_right": 0.02412555180490017,
+    "iliac_artery_left": 0.014458023011684418,
+    "iliac_artery_right": 0.005932454019784927,
+    "pulmonary_vein": 0.005319549702107906,
+    "brain": 0.0,
+    "colon": 0.007464724592864513,
+    "small_bowel": 0.0053192805498838425
+  },
+  "organ_hu_by_phase": {
+    "non-contrast": {
+      "liver": 58.0,
+      "pancreas": 43.0,
+      "urinary_bladder": 14.0,
+      "gallbladder": 20.5,
+      "heart": 40.0,
+      "aorta": 39.0,
+      "inferior_vena_cava": 39.0,
+      "portal_vein_and_splenic_vein": 37.0,
+      "iliac_vena_left": 43.0,
+      "iliac_vena_right": 43.0,
+      "iliac_artery_left": 41.0,
+      "iliac_artery_right": 44.5,
+      "pulmonary_vein": 21.0,
+      "brain": null,
+      "colon": -18.5,
+      "small_bowel": 23.0
+    },
+    "arterial": {
+      "liver": 68.11984252929688,
+      "pancreas": 95.063232421875,
+      "urinary_bladder": 14.55145263671875,
+      "gallbladder": 25.3480224609375,
+      "heart": 181.3902587890625,
+      "aorta": 276.6673583984375,
+      "inferior_vena_cava": 63.474029541015625,
+      "portal_vein_and_splenic_vein": 97.2537841796875,
+      "iliac_vena_left": 51.24688720703125,
+      "iliac_vena_right": 50.65216064453125,
+      "iliac_artery_left": 215.822021484375,
+      "iliac_artery_right": 221.62353515625,
+      "pulmonary_vein": 196.66665649414062,
+      "brain": null,
+      "colon": -22.24725341796875,
+      "small_bowel": 38.31402587890625
+    },
+    "venous": {
+      "liver": 103.10174560546875,
+      "pancreas": 88.96142578125,
+      "urinary_bladder": 15.4521484375,
+      "gallbladder": 29.1630859375,
+      "heart": 124.50262451171875,
+      "aorta": 131.8970947265625,
+      "inferior_vena_cava": 104.24365234375,
+      "portal_vein_and_splenic_vein": 131.254638671875,
+      "iliac_vena_left": 87.2589111328125,
+      "iliac_vena_right": 86.4130859375,
+      "iliac_artery_left": 118.63262939453125,
+      "iliac_artery_right": 122.91473388671875,
+      "pulmonary_vein": 99.94256591796875,
+      "brain": null,
+      "colon": -15.8604736328125,
+      "small_bowel": 45.3531494140625
+    }
+  },
+  "organ_coverage": {
+    "liver": 410,
+    "pancreas": 406,
+    "urinary_bladder": 356,
+    "gallbladder": 338,
+    "heart": 410,
+    "aorta": 410,
+    "inferior_vena_cava": 410,
+    "portal_vein_and_splenic_vein": 404,
+    "iliac_vena_left": 364,
+    "iliac_vena_right": 368,
+    "iliac_artery_left": 378,
+    "iliac_artery_right": 377,
+    "pulmonary_vein": 235,
+    "brain": 0,
+    "colon": 406,
+    "small_bowel": 403
+  }
+}

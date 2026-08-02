@@ -1,0 +1,60 @@
+=== Fold 1 ===
+              precision    recall  f1-score   support
+
+           0       1.00      1.00      1.00        22
+           1       0.90      0.82      0.86        22
+           2       0.84      0.91      0.88        23
+
+    accuracy                           0.91        67
+   macro avg       0.91      0.91      0.91        67
+weighted avg       0.91      0.91      0.91        67
+
+
+=== Fold 2 ===
+              precision    recall  f1-score   support
+
+           0       1.00      1.00      1.00        23
+           1       1.00      0.95      0.98        22
+           2       0.96      1.00      0.98        23
+
+    accuracy                           0.99        68
+   macro avg       0.99      0.98      0.99        68
+weighted avg       0.99      0.99      0.99        68
+
+
+=== Fold 3 ===
+              precision    recall  f1-score   support
+
+           0       1.00      1.00      1.00        21
+           1       0.88      0.96      0.92        23
+           2       0.95      0.87      0.91        23
+
+    accuracy                           0.94        67
+   macro avg       0.94      0.94      0.94        67
+weighted avg       0.94      0.94      0.94        67
+
+
+=== Fold 4 ===
+              precision    recall  f1-score   support
+
+           0       1.00      1.00      1.00        22
+           1       1.00      1.00      1.00        22
+           2       1.00      1.00      1.00        22
+
+    accuracy                           1.00        66
+   macro avg       1.00      1.00      1.00        66
+weighted avg       1.00      1.00      1.00        66
+
+
+=== Fold 5 ===
+              precision    recall  f1-score   support
+
+           0       1.00      1.00      1.00        22
+           1       0.95      0.95      0.95        22
+           2       0.95      0.95      0.95        22
+
+    accuracy                           0.97        66
+   macro avg       0.97      0.97      0.97        66
+weighted avg       0.97      0.97      0.97        66
+
+
