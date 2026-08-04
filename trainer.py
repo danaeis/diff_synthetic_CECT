@@ -25,7 +25,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use('Agg')
@@ -40,6 +40,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from losses import CompositeLoss
+from metrics import grad_hist_distance, raps_hf_ratio
 from models import UNetGenerator
 from models_hetero import HeteroGenerator
 
@@ -122,6 +123,142 @@ def _metric_set(p: np.ndarray, t: np.ndarray, data_range: float = 1.0) -> Dict[s
                  ((mu1 ** 2 + mu2 ** 2 + C1) * (s1 ** 2 + s2 ** 2 + C2)))
     ncc = float(s12 / (s1 * s2 + 1e-8))
     return {'mae': mae, 'psnr': psnr, 'ssim': ssim, 'ncc': ncc}
+
+
+def _center_2d(t: torch.Tensor) -> np.ndarray:
+    """A single tensor item (1,H,W) or (1,D,H,W) → the 2-D centre slice.
+
+    `_center_flat` is the same selection followed by `.ravel()`. The detail
+    metrics need the 2-D structure kept: a spectrum and a spatial gradient are
+    both undefined on a flattened voxel list."""
+    a = _np(t)
+    if a.ndim == 3:                         # (D, H, W) — centre slice
+        a = a[a.shape[0] // 2]
+    return a
+
+
+# Detail metrics are O(N) FFTs; 64 slices is `metrics.raps`'s own default and is
+# plenty for a training curve. Beyond it the estimate stops moving and the val
+# pass starts costing more than the epoch.
+_DETAIL_MAX_SLICES = 64
+
+
+def _detail_metric_set(preds: List[np.ndarray], tgts: List[np.ndarray],
+                       masks: Optional[List[np.ndarray]] = None) -> Dict[str, float]:
+    """raps_hf / grad_w1 over a stack of paired 2-D slices.
+
+    This is the axis `_metric_set` cannot see. MAE, PSNR, SSIM and NCC are all
+    minimised by the conditional mean, so they rank a blurry copy of the input
+    ABOVE a correctly-textured sample — which is exactly the failure these runs
+    exhibit. `raps_hf` reads the high-frequency amplitude ratio (1.0 = correct,
+    <1 = blur, >1 = noise/hallucination) and `grad_w1` the W1 distance between
+    edge-strength distributions (0 = correct). Neither is capped by residual
+    registration error, because neither depends on where the edges are.
+
+    The stack is passed as a pseudo-volume with `slice_axis=0`: `metrics.raps`
+    and `metrics.grad_hist_distance` both average over 2-D slices, so a batch of
+    unrelated patches is a valid input as long as pred and target are paired
+    slice-for-slice.
+    """
+    if not preds:
+        return {'val_raps_hf': 0.0, 'val_grad_w1': 0.0, 'val_org_grad_w1': 0.0}
+    g = np.stack(preds[:_DETAIL_MAX_SLICES]).astype(np.float64)
+    r = np.stack(tgts[:_DETAIL_MAX_SLICES]).astype(np.float64)
+
+    def _f(x):                        # NaN (degenerate stack) → 0.0, the "unset"
+        return float(x) if np.isfinite(x) else 0.0   # sentinel the plots already use
+
+    out = {
+        'val_raps_hf':  _f(raps_hf_ratio(g, r, slice_axis=0)),
+        'val_grad_w1':  _f(grad_hist_distance(g, r, slice_axis=0)),
+        'val_org_grad_w1': 0.0,
+    }
+    if masks:
+        m = np.stack(masks[:_DETAIL_MAX_SLICES])
+        out['val_org_grad_w1'] = _f(
+            grad_hist_distance(g, r, mask=(m > 0), slice_axis=0))
+    return out
+
+
+class WeightEMA:
+    """Exponential moving average of the model weights.
+
+    Absent from this repo entirely before now, which is unusual for a diffusion
+    model — EMA is near-universal in the DDPM lineage and is normally worth a
+    large margin on exactly the axis this project is failing at, sample quality.
+    A single-step SGD iterate is a noisy point in weight space; the average over
+    the last ~1/(1-decay) steps is not, and the difference shows up as texture
+    rather than as loss.
+
+    Warmup: at step 0 an EMA initialised from the weights and decayed at 0.999
+    lags ~1000 steps behind, so early samples would be of a near-random model.
+    `min(decay, (1 + step) / (10 + step))` ramps the effective decay from 0.1 up
+    to `decay`, which is the standard fix.
+
+    Buffers are copied, not averaged: they are counters and running statistics
+    (and, here, the schedule's alpha tables), where an average is meaningless.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.step = 0
+        self.shadow = {k: v.detach().clone().float()
+                       for k, v in model.state_dict().items()
+                       if v.dtype.is_floating_point}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        self.step += 1
+        d = min(self.decay, (1.0 + self.step) / (10.0 + self.step))
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+
+    def state_dict(self) -> Dict:
+        return {'decay': self.decay, 'step': self.step, 'shadow': self.shadow}
+
+    def load_state_dict(self, state: Dict):
+        self.decay = state.get('decay', self.decay)
+        self.step = state.get('step', 0)
+        self.shadow = {k: v.detach().clone().float()
+                       for k, v in state['shadow'].items()}
+
+    def averaged_state(self, model: nn.Module) -> Dict:
+        """A full state_dict with the averaged weights in place, dtypes preserved.
+
+        This is what gets written to the checkpoint's `G_state`, so
+        `infer_volume.load_model` uses the EMA weights without knowing EMA
+        exists. The live weights go to `G_raw_state` for exact resume.
+        """
+        out = {}
+        for k, v in model.state_dict().items():
+            out[k] = (self.shadow[k].to(v.dtype) if k in self.shadow
+                      else v.detach().clone())
+        return out
+
+    class _Swap:
+        def __init__(self, ema, model):
+            self.ema, self.model = ema, model
+            self.backup = None
+
+        def __enter__(self):
+            self.backup = {k: v.detach().clone()
+                           for k, v in self.model.state_dict().items()}
+            self.model.load_state_dict(self.ema.averaged_state(self.model))
+            return self.model
+
+        def __exit__(self, *exc):
+            self.model.load_state_dict(self.backup)
+            self.backup = None
+            return False
+
+    def swapped(self, model: nn.Module) -> '_Swap':
+        """Context manager: EMA weights inside, live weights restored on exit.
+
+        Used for every validation and sampling pass, so the curves and the sample
+        grids describe the same weights that inference will load.
+        """
+        return WeightEMA._Swap(self, model)
 
 
 class EarlyStopping:
@@ -225,6 +362,17 @@ class Trainer:
             'val_loss',
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',              # global
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',  # organ-region
+            # Detail/texture, the axis the per-voxel metrics above cannot see. A
+            # model that synthesises correct texture LOSES on val_mae relative to
+            # a blurry copy, so these are the ones to read for sample quality.
+            # raps_hf is a ratio scored as |x-1|; grad_w1 is a distance, lower is
+            # better. See metrics.raps_hf_ratio / metrics.grad_hist_distance.
+            'val_raps_hf', 'val_grad_w1', 'val_org_grad_w1',
+            # 1.0 when the val metrics on this row were freshly computed, 0.0 when
+            # they were carried forward from an earlier epoch (the diffusion path
+            # samples only every `diffusion_sample_every` epochs). Without this the
+            # curves show flat 10-epoch steps that read as plateaus but are not.
+            'val_sampled',
         ] + ([
             # Mean |gamma| per FiLM site. This is a RESULT, not diagnostics: if
             # gamma converges to ~0 the decoder learned to ignore the phase
@@ -349,6 +497,10 @@ class Trainer:
         # per-organ: {label_id: {metric: [values]}} — populated only when the
         # multi-label mask is available and report_per_organ_metrics is on.
         per: Dict[int, Dict[str, list]] = {}
+        # 2-D centre slices for the detail metrics, capped (see _DETAIL_MAX_SLICES).
+        d_pred: List[np.ndarray] = []
+        d_tgt:  List[np.ndarray] = []
+        d_mask: List[np.ndarray] = []
         for batch in val_loader:
             src = batch['source'].to(self.device)
             tgt = batch['target'].to(self.device)
@@ -357,6 +509,11 @@ class Trainer:
                 fake, _ = self._split_out(
                     self.G(src, self._phase(batch), self._level(batch)))
             for i in range(src.size(0)):
+                if len(d_pred) < _DETAIL_MAX_SLICES:
+                    d_pred.append(_center_2d(fake[i]))
+                    d_tgt.append(_center_2d(tgt[i]))
+                    if mask is not None:
+                        d_mask.append(_center_2d(mask[i]))
                 p = _center_flat(fake[i]).astype(np.float64)
                 t = _center_flat(tgt[i]).astype(np.float64)
                 for m, v in _metric_set(p, t).items():
@@ -397,6 +554,7 @@ class Trainer:
         for m in _METRICS:
             out[f'val_org_{m}'] = _mean(org[m])
         out['n_organ_items'] = len(org['mae'])
+        out.update(_detail_metric_set(d_pred, d_tgt, d_mask or None))
 
         # Per-organ breakdown, keyed by organ name (id→name if a map was loaded).
         if self.per_organ and per:
@@ -530,10 +688,18 @@ class Trainer:
         # weights, but the optimiser, LR scheduler, AMP scalers, step counter,
         # metric history and early-stopping state. Without the scheduler/history
         # a resume would restart the cosine LR cycle and drop the loss curves.
+        # With EMA on, `G_state` holds the AVERAGED weights and `G_raw_state` the
+        # live ones. That way `infer_volume.load_model`, which reads `G_state`,
+        # gets the EMA weights without knowing EMA exists, while `load_checkpoint`
+        # prefers `G_raw_state` so a resume continues from the real iterate rather
+        # than from its own average. Checkpoints written before EMA existed have
+        # only `G_state` and load unchanged.
+        ema = getattr(self, 'ema', None)
         state = {
             'epoch':       epoch,
             'global_step': self.global_step,
-            'G_state':     self.G.state_dict(),
+            'G_state':     (ema.averaged_state(self.G) if ema is not None
+                            else self.G.state_dict()),
             'opt_G':       self.opt_G.state_dict(),
             'best_val':    self.best_val_loss,
             'history':     self.history,
@@ -543,6 +709,9 @@ class Trainer:
             'early_stop':  {'best': self.early_stop.best,
                             'counter': self.early_stop.counter},
         }
+        if ema is not None:
+            state['G_raw_state'] = self.G.state_dict()
+            state['ema'] = ema.state_dict()
         if self.sched_G is not None:
             state['sched_G'] = self.sched_G.state_dict()
         if self.use_amp:
@@ -579,7 +748,20 @@ class Trainer:
 
     def load_checkpoint(self, path: str) -> int:
         state = torch.load(path, map_location=self.device)
-        self.G.load_state_dict(state['G_state'])
+        # Prefer the live weights over the averaged ones: resuming from the EMA
+        # would restart training from a point the optimiser state does not match.
+        self.G.load_state_dict(state.get('G_raw_state') or state['G_state'])
+        ema = getattr(self, 'ema', None)
+        if ema is not None:
+            if state.get('ema'):
+                ema.load_state_dict(state['ema'])
+            else:
+                # Resuming a pre-EMA run, or one trained with ema_decay=0. Seed
+                # the average from the loaded weights instead of leaving it at a
+                # random init that would take ~1/(1-decay) steps to wash out.
+                log.info("  no EMA state in checkpoint — seeding EMA from the "
+                         "loaded weights")
+                ema.__init__(self.G, ema.decay)
         self.opt_G.load_state_dict(state['opt_G'])
         if 'sched_G' in state and self.sched_G is not None:
             self.sched_G.load_state_dict(state['sched_G'])
@@ -612,6 +794,17 @@ class Trainer:
         return ep
 
     # -----------------------------------------------------------------------
+    def _selection_label(self) -> str:
+        """Human-readable name of what `_selection_score` minimises, for the plot
+        title. Subclasses that override `_selection_score` should override this
+        too, so the figure never claims a selection rule the code does not use."""
+        return f"selection: {self.cfg.get('selection_metric', 'val_org_ssim')}"
+
+    def _early_stop_score(self, val: Dict, selection_score: float) -> float:
+        """Value to MINIMISE for early-stopping patience. Same as the selection
+        score unless a subclass needs a signal available on every epoch."""
+        return selection_score
+
     def _selection_score(self, val: Dict) -> float:
         """Value to MINIMISE for best-checkpoint selection and early stopping.
 
@@ -649,8 +842,12 @@ class Trainer:
             h[f'train_{k}'].append(avgs.get(k, 0.0))
         for k in ['val_loss',
                   'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
-                  'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc']:
+                  'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',
+                  'val_raps_hf', 'val_grad_w1', 'val_org_grad_w1']:
             h[k].append(val.get(k, 0.0))
+        # Deterministic trainers validate every epoch, so a missing flag means
+        # "fresh". Only the diffusion path ever carries values forward.
+        h['val_sampled'].append(float(val.get('val_sampled', 1.0)))
         for k, v in self.G.film_stats().items():
             if k in h:
                 h[k].append(v)
@@ -673,20 +870,77 @@ class Trainer:
         log.info(f"  per-organ | {line}")
 
     def _plot_history(self):
+        """Three rows: train losses, per-voxel val metrics, detail/texture metrics.
+
+        Two things this deliberately does NOT do, both of which made the earlier
+        two-row version misleading:
+
+        1. It never draws a carried-forward val value as if it were measured. The
+           diffusion path samples only every `diffusion_sample_every` epochs and
+           repeats the last value in between; plotted as a line that reads as a
+           10-epoch plateau. Rows 2 and 3 plot markers at the epochs actually
+           measured (`val_sampled == 1`) with a faint connecting line.
+        2. It no longer hides `val_loss`, which is what drives checkpoint
+           selection and early stopping on the diffusion path and was previously
+           absent from the figure entirely.
+
+        Row 3 is the axis that matters for sample quality: `val_mae` and friends
+        cannot see blur-vs-texture, and rank a blurry copy above a correctly
+        textured sample. Read `raps_hf` as |x - 1| (<1 blur, >1 noise) and
+        `grad_w1` as a distance.
+        """
         if not self.history['epoch']:
             return
         ep = self.history['epoch']
-        fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+        # Epochs whose val row was freshly measured. Older history.json files
+        # predate the flag; treat every row as fresh so they still plot.
+        fresh = self.history.get('val_sampled') or [1.0] * len(ep)
+        fresh = [bool(v) for v in fresh[:len(ep)]]
+        fresh += [True] * (len(ep) - len(fresh))
+
+        def _legend(ax):
+            """Only when something was actually drawn — a bare ax.legend() on an
+            empty axis warns once per panel per plot, and these panels are empty
+            for any run predating the detail metrics."""
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend()
+
+        def _val_plot(ax, key, label, color=None):
+            """Markers at measured epochs, faint line for the carried-forward shape.
+
+            Exact 0.0 is this codebase's "not measured" sentinel for every val
+            metric (`_validate` seeds them at 0.0, `_detail_metric_set` maps NaN
+            to 0.0, `n_organ_items` exists to disambiguate a real 0). Drawing it
+            as a value rescales the axis to include a number no model produced —
+            on a diffusion run it drags the PSNR panel from a 25-28 dB range down
+            to 0-28 and flattens the entire curve. Masked to NaN so matplotlib
+            leaves a gap.
+            """
+            ys = self.history.get(key)
+            if not ys:
+                return
+            n = min(len(ys), len(ep))
+            ys = [float('nan') if y == 0.0 else y for y in ys[:n]]
+            if not any(y == y for y in ys):        # all-NaN → nothing measured
+                return
+            xs_m = [e for e, f, y in zip(ep, fresh, ys) if f and y == y]
+            ys_m = [y for f, y in zip(fresh, ys) if f and y == y]
+            ln, = ax.plot(ep[:n], ys, alpha=0.25, lw=1, color=color)
+            ax.plot(xs_m, ys_m, 'o', ms=3, label=label, color=ln.get_color())
+
+        fig, axes = plt.subplots(3, 4, figsize=(20, 12))
 
         ax = axes[0, 0]
         ax.plot(ep, self.history['train_gen_total'], label='Gen total')
-        ax.set_title('Total loss'); ax.legend(); ax.grid(alpha=0.3)
+        ax.set_title('Total loss'); _legend(ax); ax.grid(alpha=0.3)
 
         ax = axes[0, 1]
         for k, lbl in [('train_l1', 'L1'), ('train_nll', 'GaussNLL')]:
             if any(v > 0 for v in self.history[k]):
                 ax.plot(ep, self.history[k], label=lbl)
-        ax.set_title('Fidelity term'); ax.legend(); ax.grid(alpha=0.3)
+        # Both are RAW, un-lambda-scaled, so the panel means the same thing in
+        # every mode. Multiply L1 by history['lambda_l1'] for its contribution.
+        ax.set_title('Fidelity term (raw, unweighted)'); _legend(ax); ax.grid(alpha=0.3)
 
         ax = axes[0, 2]
         for k, lbl in [('train_ssim','SSIM'), ('train_grad','Grad'),
@@ -694,21 +948,46 @@ class Trainer:
                         ('train_hu_profile','HUprof')]:
             if any(v > 0 for v in self.history[k]):
                 ax.plot(ep, self.history[k], label=lbl)
-        ax.set_title('Extra losses'); ax.legend(); ax.grid(alpha=0.3)
+        ax.set_title('Extra losses'); _legend(ax); ax.grid(alpha=0.3)
 
         axes[0, 3].plot(ep, self.history['lr_gen']); axes[0, 3].set_title('LR (gen)')
         axes[0, 3].grid(alpha=0.3)
 
-        # Bottom row: each of the 4 val metrics, global vs organ-region overlaid.
+        # Row 2: the 4 per-voxel val metrics, global vs organ-region overlaid.
         # Only draw the organ line if organ metrics were actually recorded.
         has_organ = any(v > 0 for v in self.history['val_org_mae'])
         for col, (m, title) in enumerate([('mae', 'Val MAE'), ('psnr', 'Val PSNR'),
                                           ('ssim', 'Val SSIM'), ('ncc', 'Val NCC')]):
             ax = axes[1, col]
-            ax.plot(ep, self.history[f'val_{m}'], label='global')
+            _val_plot(ax, f'val_{m}', 'global')
             if has_organ:
-                ax.plot(ep, self.history[f'val_org_{m}'], label='organ')
-            ax.set_title(title); ax.legend(); ax.grid(alpha=0.3)
+                _val_plot(ax, f'val_org_{m}', 'organ')
+            ax.set_title(f'{title}  (per-voxel)'); _legend(ax); ax.grid(alpha=0.3)
+
+        # Row 3: the detail axis, plus the quantity selection actually reads.
+        ax = axes[2, 0]
+        _val_plot(ax, 'val_raps_hf', 'raps_hf')
+        if any(v > 0 for v in self.history.get('val_raps_hf', [])):
+            ax.axhline(1.0, color='k', ls='--', lw=1, alpha=0.5)
+        else:
+            ax.text(0.5, 0.5, 'not recorded\n(run predates detail metrics)',
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=9, alpha=0.5)
+        ax.set_title('Val RAPS-hf  (1.0 = correct detail)')
+        _legend(ax); ax.grid(alpha=0.3)
+
+        ax = axes[2, 1]
+        _val_plot(ax, 'val_grad_w1', 'global')
+        _val_plot(ax, 'val_org_grad_w1', 'organ')
+        ax.set_title('Val gradW1  (0 = correct edge stats)')
+        _legend(ax); ax.grid(alpha=0.3)
+
+        ax = axes[2, 2]
+        ax.plot(ep, self.history['val_loss'], label='val_loss')
+        ax.set_title(f'Val loss  ({self._selection_label()})')
+        _legend(ax); ax.grid(alpha=0.3)
+
+        axes[2, 3].axis('off')
 
         plt.tight_layout()
         plt.savefig(self.out / 'curves.png', dpi=120, bbox_inches='tight')
@@ -783,7 +1062,12 @@ class Trainer:
             if epoch % save_every == 0:
                 self._save_samples(val_loader, epoch)
 
-            if self.early_stop.step(score):
+            # Early stopping reads its own signal. They coincide here, but the
+            # diffusion path selects on a metric that only exists on sampling
+            # epochs while needing a per-epoch signal to count patience against;
+            # collapsing the two would stop a still-improving run after
+            # `patience` non-sampling epochs. See DiffusionTrainer.
+            if self.early_stop.step(self._early_stop_score(val, score)):
                 log.info(f"Early stopping at epoch {epoch}")
                 break
 

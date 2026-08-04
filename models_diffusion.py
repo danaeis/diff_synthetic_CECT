@@ -86,6 +86,64 @@ def from_model(x11: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Offset noise
+# ---------------------------------------------------------------------------
+
+def offset_noise(like: torch.Tensor, c: float,
+                 generator: Optional[torch.Generator] = None) -> torch.Tensor:
+    """i.i.d. Gaussian noise plus a per-item constant of scale `c`.
+
+    WHY THIS EXISTS, in the terms of this project.
+
+    The quantity the whole fork is trying to sample is a per-case, spatially
+    flat HU offset — the real aortic level spans 96-218 HU across cases, sd 24.4
+    HU (analysis/BASELINE_REFERENCE.md §2). In a 128x128 patch that is exactly
+    one degree of freedom: the patch mean. Two things then go wrong at once with
+    plain `randn_like`:
+
+    1. **The prior has almost no DC.** The mean of 128x128 unit white noise has
+       sd 1/128 = 0.0078, and this module's domain is [-1,1] over a 600 HU
+       window, i.e. 300 HU per unit — so 2.3 HU. At eta=0 the DDIM sample is a
+       deterministic function of x_T, so 2.3 HU is the entire budget the sampler
+       has for a quantity whose true spread is 24.4 HU. Roughly 10x short.
+    2. **The loss barely sees it.** `F.mse_loss` is unweighted over spatial
+       frequencies, so the DC direction is 1 of 16384 and contributes ~0.006% of
+       the gradient. The model is never paid to get it right.
+
+    Adding a per-item constant (Guttenberg's offset noise, the standard fix for
+    "the model cannot produce very dark or very bright images") gives the DC
+    channel a prior with sd `c` instead of 1/sqrt(HW), and raises its share of
+    the MSE by the same factor.
+
+    THIS MUST BE APPLIED AT BOTH TRAINING AND SAMPLING. The noise is no longer
+    exactly N(0, I) — total variance is 1 + c^2 — which is a deliberate deviation
+    from the schedule's assumption. Using it on one side only is a train/test
+    mismatch, not a half-measure. `infer_volume.DiffusionPredictor._build_noise`
+    is the sampling half, and it draws ONE constant for the whole padded volume
+    rather than one per tile, so every tile of a case agrees on the level — which
+    is the same coherence argument that makes the noise field volume-wide in the
+    first place.
+
+    `c=0` returns plain `randn_like` exactly, so the flag is a true no-op.
+    """
+    if generator is not None:
+        n = torch.randn(like.shape, generator=generator, dtype=like.dtype,
+                        device=like.device)
+    else:
+        n = torch.randn_like(like)
+    if not c:
+        return n
+    # One scalar per (batch item, channel), broadcast over every spatial axis.
+    shape = (like.shape[0], like.shape[1]) + (1,) * (like.ndim - 2)
+    if generator is not None:
+        off = torch.randn(shape, generator=generator, dtype=like.dtype,
+                          device=like.device)
+    else:
+        off = torch.randn(shape, dtype=like.dtype, device=like.device)
+    return n + c * off
+
+
+# ---------------------------------------------------------------------------
 # Noise schedule
 # ---------------------------------------------------------------------------
 
@@ -149,6 +207,71 @@ class NoiseSchedule(nn.Module):
                     - self._g(self.sqrt_1mab, t, x0.ndim) * x0)
         raise ValueError(f"unknown parameterisation {param!r}; "
                          f"expected one of {PARAMETERISATIONS}")
+
+    def snr(self, t: torch.Tensor) -> torch.Tensor:
+        """alpha_bar_t / (1 - alpha_bar_t), the signal-to-noise ratio at t."""
+        ab = self.alphas_cumprod.to(t.device)[t]
+        return ab / (1.0 - ab).clamp_min(1e-12)
+
+    # Implicit weight that each parameterisation's plain MSE already places on
+    # the x0 ERROR — the common currency for comparing objectives across t.
+    #   ||d_eps||^2 = SNR      * ||d_x0||^2
+    #   ||d_x0 ||^2 = 1        * ||d_x0||^2
+    #   ||d_v  ||^2 = (SNR+1)  * ||d_x0||^2      (v = (sqrt(ab)*x_t - x0)/sqrt(1-ab))
+    _IMPLICIT_X0_WEIGHT = {
+        'x0': lambda snr: torch.ones_like(snr),
+        'v':  lambda snr: snr + 1.0,
+    }
+
+    def snr_loss_weight(self, t: torch.Tensor, gamma: float,
+                        param: str) -> torch.Tensor:
+        """Per-timestep loss weight that flattens the objective in x0 space.
+
+        Diffusion training is a multi-task problem across t and the tasks
+        conflict. Measured on this schedule, the x0-error weight each plain MSE
+        implies is:
+
+            t              0        250      500     700     900     999
+            plain v-MSE    2.4e+04  6.49     1.97    1.25    1.02    1.00
+            plain x0-MSE   1        1        1       1       1       1
+
+        So `--parameterisation v` — the default — over-weights t=0 by a factor of
+        24,000 relative to t=999. That is the low-t domination min-SNR-gamma
+        exists to fix, and it means `diff_v` and `diff_x0` were never optimising
+        comparable objectives.
+
+        WHERE THIS DEVIATES FROM Hang et al. 2023 (arXiv 2303.09556), and why.
+        The published target is `min(SNR, gamma)` on the x0 error, which on this
+        schedule is [5, 5, 0.97, 0.25, 0.024, 1e-8] — it clamps the low-t blowup
+        but drives the weight at high t to essentially ZERO. For image-quality
+        work that is fine; the high-t steps carry little visible detail. For THIS
+        project it is backwards: the quantity being recovered is a case-level HU
+        offset, which is decided at high t (v ~ -x0 there), and the published
+        weighting would suppress exactly the timesteps that carry it.
+
+        So the target used here is `min(SNR, gamma) / SNR`, which is flat at 1.0
+        for every t with SNR <= gamma and decays only where SNR exceeds it:
+
+            t              0        250      500     700     900     999
+            target         2.1e-04  0.911    1       1       1       1
+
+        Low-t domination is removed, high t keeps full weight. `gamma` is the SNR
+        above which a timestep starts being discounted; 5.0 is the paper's value
+        and is kept because it is the point where this schedule's SNR curve turns
+        over, not out of deference.
+
+        The returned multiplier divides out whatever the parameterisation already
+        implies, so both parameterisations optimise the SAME objective and their
+        losses become comparable. Returns a (B,) tensor; the caller broadcasts.
+        """
+        try:
+            implicit = self._IMPLICIT_X0_WEIGHT[param](self.snr(t))
+        except KeyError:
+            raise ValueError(f"unknown parameterisation {param!r}; "
+                             f"expected one of {PARAMETERISATIONS}") from None
+        snr = self.snr(t)
+        target = snr.clamp(max=gamma) / snr.clamp_min(1e-12)
+        return target / implicit
 
     def predict_x0(self, out: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor,
                    param: str, clip: bool = True) -> torch.Tensor:

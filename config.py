@@ -142,9 +142,32 @@ MIN_PATCH_MAX  = -500.0           # must have at least some tissue
 # phase-consistency losses so patches actually contain the aorta/portal vein/IVC
 # those losses depend on. ORGAN_FOCUS_LABELS restricts the focus to specific
 # TotalSegmentator label ids (needs MULTILABEL masks); None = any mask>0 voxel.
+# MEASURED, on the current 20k-patch cache: of 16 sampled training patches in
+# `patch_grids/train_patch_grid.png`, roughly four contain an abdominal organ.
+# The rest are shoulder, arm, chest wall, subcutaneous fat, spine and air —
+# tissue that does not enhance, where the correct output is a copy of the input.
+# The uniform grid passes 92.4% of candidates (188,168 of 203,584), so most
+# gradient steps are training the identity map. That is the leading explanation
+# for generated volumes that are closer to the NCCT than the NCCT is to the CECT.
 ORGAN_FOCUS_FRAC   = 0.0
 ORGAN_FOCUS_LABELS = None         # e.g. aorta/IVC/portal-vein ids for phase work
 MAX_FOCUS_CAND_PER_VOL = 3000
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+# 'none' | 'flip_ap' | 'flip' | 'flip_rot90'. Train split only; see
+# dataset.CTPairDataset._augment. Applied at __getitem__, so it does NOT enter
+# the patch-cache key and costs no re-cache.
+#
+# There was no augmentation of any kind before this: the cache is a fixed set of
+# patches and __getitem__ a list lookup, so 200 epochs saw 200 copies of the same
+# 20,000 images drawn from 97 cases, using 10.6% of the 188k available. The
+# measured cost is a ~2x train/val gap (`memorize97`: train MAE 0.0086, val
+# 0.0157; `capacity_overfit`: 0.0058 vs 0.0192) — these models overfit, they do
+# not underfit, so capacity and schedule length are not the lever.
+#
+# NO INTENSITY MODE EXISTS, deliberately. The prediction target is an absolute HU
+# level (aortic case-to-case sd 24.4 HU) and jitter destroys it. See _augment.
+AUGMENT = 'flip'
 
 # ── RAM preload budget ────────────────────────────────────────────────────────
 MAX_TRAIN_PATCHES = 20_000
@@ -468,14 +491,63 @@ AUX_MAX_T        = 700
 # drawn, and selecting a checkpoint on it is selecting on noise.
 DIFFUSION_VAL_SEED    = 1234
 
-# Sampled val metrics cost a full DDIM pass, so they run every N epochs and are
-# for looking at, never for selection (see DiffusionTrainer._selection_score).
+# Sampled val metrics cost a full DDIM pass, so they run every N epochs. They are
+# now also what `diffusion_selection='detail'` selects on, so lowering this buys
+# more checkpoint candidates at the cost of a DDIM pass per epoch.
 DIFFUSION_SAMPLE_EVERY = 10
 DIFFUSION_SAMPLE_STEPS = 25
 
+# ── Diffusion: the level channel ──────────────────────────────────────────────
+# Scale of the per-item DC component added to the training noise, and of the
+# single per-VOLUME constant added to the inference noise field. 0 disables.
+#
+# The rationale in one line: the quantity this fork exists to sample is a flat
+# per-case HU offset with sd 24.4 HU, but the mean of a 128x128 unit-noise patch
+# has sd 1/128 = 2.3 HU on this window, and an unweighted MSE gives that
+# direction 1/16384 of the gradient. The prior is ~10x too narrow and the loss
+# barely sees it. See models_diffusion.offset_noise for the full argument.
+#
+# MUST match between training and sampling — it is read back out of
+# run_config.json by infer_volume.DiffusionPredictor, never from a CLI default.
+DIFFUSION_OFFSET_NOISE = 0.1
+
+# min-SNR-gamma loss weighting (Hang et al. 2023). 0 disables; 5.0 is the paper's
+# value. Rebalances the objective away from the low-t steps that dominate an
+# unweighted MSE and toward the high-t steps that decide the level.
+# See NoiseSchedule.min_snr_weight.
+MIN_SNR_GAMMA = 5.0
+
+# EMA decay for the diffusion weights. 0 disables. Near-universal in the DDPM
+# lineage and absent from this repo until now. The averaged weights are what
+# every val pass, every sample grid and `infer_volume` see; the live weights are
+# kept in the checkpoint's `G_raw_state` so a resume is exact.
+EMA_DECAY = 0.999
+
+# Adam betas on the DIFFUSION path only. The project-wide BETAS = (0.5, 0.999) is
+# inherited from the GAN baseline, where a short momentum window keeps the
+# generator responsive to a moving discriminator. There is no discriminator here
+# and the objective is stationary, so the longer DDPM/ADM standard window is what
+# averages away the per-step timestep noise.
+DIFFUSION_BETAS = (0.9, 0.999)
+
+# How `best_model.pth` is chosen on the diffusion path.
+#   'detail'   |raps_hf - 1| + organ gradW1, from the DDIM sample. The default.
+#   'val_loss' the denoising MSE. Legacy, and structurally wrong: every
+#              per-voxel loss is minimised by the conditional mean, so it picks
+#              the epoch whose samples are blurriest — the exact failure this
+#              fork exists to fix. Kept only to reproduce the earlier runs.
+# `SELECTION_METRIC` above is not consulted on this path; it names metrics that
+# need a deterministic forward pass.
+DIFFUSION_SELECTION = 'detail'
+
 # ── Misc ─────────────────────────────────────────────────────────────────────
 USE_AMP              = True
-KEEP_N_CHECKPOINTS   = 3
+# Rolling checkpoints kept besides `best_model.pth`. Raised from 3 because
+# `best_model.pth` is chosen on ONE metric, and when that metric turns out to
+# have been the wrong one (val_loss selecting the blurriest epoch, see
+# DIFFUSION_SELECTION) the alternative epochs have already been deleted and the
+# run has to be repeated from scratch to recover them.
+KEEP_N_CHECKPOINTS   = 10
 SAVE_SAMPLES_EVERY   = 1
 KEEP_N_SAMPLE_EPOCHS = 5
 
@@ -538,6 +610,7 @@ train_config: dict = dict(
     min_patch_mean       = MIN_PATCH_MEAN,
     min_patch_max        = MIN_PATCH_MAX,
     # organ-focused sampling
+    augment                    = AUGMENT,
     organ_focus_frac           = ORGAN_FOCUS_FRAC,
     organ_focus_labels         = ORGAN_FOCUS_LABELS,
     max_focus_candidates_per_vol = MAX_FOCUS_CAND_PER_VOL,
@@ -601,6 +674,11 @@ train_config: dict = dict(
     diffusion_val_seed   = DIFFUSION_VAL_SEED,
     diffusion_sample_every = DIFFUSION_SAMPLE_EVERY,
     diffusion_sample_steps = DIFFUSION_SAMPLE_STEPS,
+    diffusion_selection    = DIFFUSION_SELECTION,
+    diffusion_offset_noise = DIFFUSION_OFFSET_NOISE,
+    min_snr_gamma          = MIN_SNR_GAMMA,
+    ema_decay              = EMA_DECAY,
+    diffusion_betas        = DIFFUSION_BETAS,
     # misc
     use_mixed_precision     = USE_AMP,
     keep_last_n_checkpoints = KEEP_N_CHECKPOINTS,

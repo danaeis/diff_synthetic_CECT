@@ -70,12 +70,31 @@ def _phase_id(v) -> int:
 def read_tiling(manifest: Path) -> Dict:
     """Patch geometry from the run's own run_config.json, for the seam metric.
 
-    `<run>/phase_infer/manifest.csv` → `<run>/run_config.json`. Returns {} for
-    models that were not produced by this pipeline (external baselines, whole-slice
-    models) — the seam metric is then reported as NaN rather than as a wrong
-    number computed against a tiling that never happened.
+    `<run>/phase_infer/manifest.csv` → `<run>/run_config.json`, and
+    `<run>/phase_infer/<phase>/manifest.csv` → the same file one level further up.
+    The config is located by walking UP rather than by a fixed `parent.parent`,
+    which was correct only for the flat layout: for a multi-phase run it resolved
+    to `<run>/phase_infer/`, found nothing, and returned {} — so seam came out NaN
+    for exactly those runs and read as "no tiling geometry" rather than as a bug.
+
+    Returns {} for models that genuinely were not produced by this pipeline
+    (external baselines, whole-slice models) — the seam metric is then reported as
+    NaN rather than as a wrong number computed against a tiling that never
+    happened.
+
+    Anchored on the `phase_infer/` directory rather than on a depth count, because
+    the two layouts sit at different depths and no single count is right for both.
+    A plain "walk up until a run_config.json turns up" is worse still: for a model
+    that genuinely has none it would keep climbing into the runs_dir and score the
+    seam against some unrelated run's patch geometry — a wrong number where NaN is
+    the correct answer.
+
+    Falls back to the historical `parent.parent` for an output directory not named
+    `phase_infer` (infer_volume.py's --out_dir is free-form).
     """
-    cfg_path = manifest.parent.parent / 'run_config.json'
+    anchor = next((q for q in manifest.parents if q.name == 'phase_infer'), None)
+    cfg_path = ((anchor.parent if anchor else manifest.parent.parent)
+                / 'run_config.json')
     if not cfg_path.exists():
         return {}
     try:
@@ -228,15 +247,51 @@ PAIRED_METRICS = [
 ]
 
 
+def select_baseline(all_rows: Dict[str, List[Dict]], requested: Optional[str]) -> str:
+    """The model every paired test is measured against.
+
+    Raises SystemExit rather than returning something unusable, in both failure
+    modes. On an EMPTY table the old expression `next((n for n in all_rows if
+    'only' in n), next(iter(all_rows)))` raised a bare StopIteration — Python
+    evaluates the `next()` default eagerly, so the inner call fires first — with
+    no hint that the real cause was every case failing to load.
+
+    A `--baseline` naming the run DIRECTORY is accepted too: discover() strips the
+    `literature_baseline_` prefix from its keys, so the spelling a user reads off
+    `ls` would otherwise silently never match.
+    """
+    if not all_rows:
+        raise SystemExit('no model produced a scored case — nothing to use as a '
+                         'baseline')
+    if requested is None:
+        # An `*_only` run is the natural reference: it is the ablation floor.
+        return next((n for n in all_rows if 'only' in n), next(iter(all_rows)))
+    for cand in (requested, requested.replace('literature_baseline_', '')):
+        if cand in all_rows:
+            return cand
+    raise SystemExit(f'--baseline {requested!r} is not one of the scored models: '
+                     + ', '.join(all_rows))
+
+
 def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
     out.append(f'\n## Paired per-case tests vs "{base}"  (negative = better)')
     br = {r['_key']: r for r in all_rows[base]}
-    out.append(f"\n{'model':16s}{'metric':16s}{'delta':>10}{'t':>8}{'sig':>5}{'better':>9}")
+    out.append(f"\n{'model':26s}{'metric':16s}{'delta':>10}{'t':>8}{'sig':>5}{'better':>9}")
     for name, rows in all_rows.items():
         if name == base:
             continue
         rr = {r['_key']: r for r in rows}
         common = [c for c in br if c in rr]
+        if not common:
+            # No shared cases — e.g. an arterial arm against a venous baseline,
+            # where `_key` is the real CECT path and the two never coincide.
+            # paired_t([]) returns (0.0, 0.0, 0), so without this the block would
+            # print a full set of '+0.000 ns' rows that read as "identical to the
+            # baseline" when nothing was actually compared.
+            out.append(f'{name:26s}— no cases in common with the baseline; '
+                       f'not comparable')
+            out.append('')
+            continue
         first = True
         for metric, better_is_low, tf, label in PAIRED_METRICS:
             d = []
@@ -248,7 +303,7 @@ def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
                     a, b = tf(a), tf(b)
                 d.append((b - a) if better_is_low else (a - b))   # sign: neg = better
             m, t, w = paired_t(d)
-            out.append(f"{(name if first else ''):16s}{label:16s}"
+            out.append(f"{(name if first else ''):26s}{label:16s}"
                        f"{m:+10.3f}  {t:+8.2f}  {sig(t):>4}{w:>5}/{len(d)}")
             first = False
         out.append('')
@@ -305,11 +360,51 @@ def master_table(summaries: List[Dict], out: List[str]):
 # ---------------------------------------------------------------------------
 
 def discover(runs_dir: Path) -> Dict[str, Path]:
-    found = {}
+    """Trained runs that also have a manifest, i.e. have been through infer_volume.py.
+
+    A run with a checkpoint but no manifest is reported rather than silently
+    dropped: that is a missing inference step, not an absent model, and it is
+    invisible in the output table otherwise.
+
+    Only `phase_infer/` is scanned, never infer_volume.py's other `--out_dir`
+    spellings. `literature_baseline_l1_adv` for instance also has a
+    `phase_infer_hann/`, and a guidance sweep writes `phase_infer_g1.5/` and
+    friends. Those are the SAME checkpoint under different inference settings, so
+    auto-discovering them would silently put several rows for one model in a table
+    whose rows are supposed to be models — and the paired block would compare a
+    model against itself. Score them deliberately, with
+    `--manifest name=<run>/phase_infer_hann/manifest.csv`.
+    """
+    found, pending = {}, []
     for d in sorted(runs_dir.iterdir()):
-        m = d / 'phase_infer' / 'manifest.csv'
-        if m.exists():
-            found[d.name.replace('literature_baseline_', '')] = m
+        if not d.is_dir():
+            continue
+        name = d.name.replace('literature_baseline_', '')
+        pi = d / 'phase_infer'
+        if (pi / 'manifest.csv').exists():
+            found[name] = pi / 'manifest.csv'
+            continue
+        # MULTI-PHASE runs write one manifest per phase SUBDIRECTORY
+        # (infer_volume.py: a multi-phase model emits several volumes per case,
+        # which would collide on '{case_id}_syn.nii.gz' in a single directory).
+        # Looking only for the flat manifest silently skipped those runs
+        # entirely — they were absent from the table rather than reported.
+        #
+        # Each phase becomes its OWN model row, `<run>/<phase>`. They must not be
+        # pooled: an arterial and a venous volume are different targets, and
+        # averaging their featHU would make the multi-phase arms incomparable to
+        # every single-phase run, which is the whole point of the M1/M2/M3 design.
+        per_phase = sorted(pi.glob('*/manifest.csv')) if pi.is_dir() else []
+        if per_phase:
+            for m in per_phase:
+                found[f'{name}/{m.parent.name}'] = m
+            continue
+        if (d / 'best_model.pth').exists():
+            pending.append(d.name)
+    if pending:
+        print(f'  [discover] {len(pending)} trained run(s) have no '
+              f'phase_infer/manifest.csv and are NOT scored — run infer_volume.py '
+              f'on them first: {", ".join(pending)}')
     return found
 
 
@@ -371,10 +466,23 @@ def main():
         print(f'  [{name}] n={s["n"]} PSNR {s["psnr"]:.2f} oSSIM {s["org_ssim"]:.4f} '
               f'featHU {s["feature_l1_hu"]:.2f}')
 
+    if not all_rows:
+        # Every model was skipped. Without this the next few lines fail on an empty
+        # container in three different ways — `next(iter({}))` (evaluated EAGERLY as
+        # the default arg below, so it raises before the outer next() runs),
+        # summaries[0], flat[0] — and the user gets a bare StopIteration with no
+        # message. The overwhelmingly common cause is manifest paths: they are
+        # stored as written at generation time and are relative to the repo root.
+        raise SystemExit(
+            'no model produced a scored case. The manifests were found, but every '
+            'case failed to load — check that their gen_path/real_path/mask_path '
+            'resolve from the current working directory (they are stored relative '
+            'to the repo root, so run benchmark.py from there).')
+
     lines: List[str] = []
     master_table(summaries, lines)
-    base = args.baseline or next((n for n in all_rows if 'only' in n), next(iter(all_rows)))
-    if base in all_rows and len(all_rows) > 1:
+    base = select_baseline(all_rows, args.baseline)
+    if len(all_rows) > 1:
         paired_block(all_rows, base, lines)
     report = '\n'.join(lines)
     print('\n' + report)

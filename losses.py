@@ -523,7 +523,14 @@ class CompositeLoss(nn.Module):
                                  "would be silently ignored.")
             _lam_l1 = self._l1_w()
             l1 = F.l1_loss(pred, target) * _lam_l1
-            d['l1'] = l1.item();  total = total + l1
+            # RAW MAE, not the lambda-scaled contribution. The hetero branch above
+            # logs the raw value and this branch used to log the scaled one, so
+            # `history['train_l1']` changed units by ~100x depending on a flag and
+            # `_plot_history` drew both on one axis. The scaled contribution is
+            # still recoverable as train_l1 * lambda_l1, and `train_gen_total`
+            # carries the optimised sum either way.
+            d['l1'] = float(l1.detach()) / _lam_l1 if _lam_l1 else 0.0
+            total = total + l1
             d['lambda_l1'] = _lam_l1    # logged so the curriculum is auditable
             d['nll'] = 0.0
 

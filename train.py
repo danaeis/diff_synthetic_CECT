@@ -90,10 +90,30 @@ def _parse():
     p.add_argument('--batch_size',  type=int,   default=None)
     p.add_argument('--lr',          type=float, default=None)
     p.add_argument('--output_dir',  type=str,   default=None)
+    p.add_argument('--data_dir',    type=str,   default=None,
+                   help='override config.DATA_DIR. Pass an ABSOLUTE path: the '
+                        'config default is relative and a run was lost on '
+                        '2026-07-31 because it resolved against the wrong cwd. '
+                        'Recorded in run_config.json, so infer_volume.py and '
+                        'benchmark.py find the same data later.')
     p.add_argument('--patch_size',  type=int,   default=None)
     p.add_argument('--patch_depth', type=int,   default=None,
                    help='1=2D (default), >1=3D (must also set --dims 3)')
     p.add_argument('--dims',        type=int,   default=None, choices=[2, 3])
+    p.add_argument('--augment', type=str, default=None,
+                   choices=['none', 'flip_ap', 'flip', 'flip_rot90'],
+                   help='train-split geometric augmentation (default flip). '
+                        'Applied at __getitem__, so it does not change the patch '
+                        'cache. No intensity mode exists — the target is an '
+                        'absolute HU level and jitter destroys it.')
+    p.add_argument('--organ_focus_frac', type=float, default=None,
+                   help='fraction of training patches whose CENTRE sits on an '
+                        'organ voxel (default 0.0 = uniform grid). At 0.0 most '
+                        'patches are body wall, limb and air, where the correct '
+                        'output is a copy of the input — see config.py.')
+    p.add_argument('--organ_focus_labels', type=int, nargs='+', default=None,
+                   help='restrict --organ_focus_frac to these TotalSegmentator '
+                        'label ids (needs multi-label masks); default any mask>0')
 
     # ── Capacity probes (Gate B of the roadmap) ──────────────────────────────
     # These exist to answer "can this model fit its own training data at all?",
@@ -158,8 +178,31 @@ def _parse():
                         'only below this timestep (default 700 of 1000).')
     p.add_argument('--diffusion_sample_every', type=int, default=None,
                    help='epochs between DDIM sampling passes on val patches. '
-                        'These are for looking at; selection uses the '
-                        'deterministic denoising loss regardless.')
+                        'Under --diffusion_selection detail these are also the '
+                        'only epochs eligible to become best_model.pth, so '
+                        'lowering it buys more candidates at one DDIM pass each.')
+    p.add_argument('--diffusion_selection', type=str, default=None,
+                   choices=['detail', 'val_loss'],
+                   help="how best_model.pth is picked on the diffusion path. "
+                        "'detail' (default) = |raps_hf-1| + organ gradW1 from the "
+                        "DDIM sample. 'val_loss' = denoising MSE, which selects "
+                        "the blurriest epoch and is kept only to reproduce the "
+                        "earlier runs.")
+    p.add_argument('--diffusion_offset_noise', type=float, default=None,
+                   help='scale of the per-item DC component added to the '
+                        'training noise, and of the per-VOLUME constant added at '
+                        'sampling (default 0.1; 0 = plain randn). The level this '
+                        'project samples is one degree of freedom that white '
+                        'noise barely carries — see models_diffusion.offset_noise.')
+    p.add_argument('--min_snr_gamma', type=float, default=None,
+                   help='min-SNR-gamma loss weighting (default 5.0; 0 disables)')
+    p.add_argument('--ema_decay', type=float, default=None,
+                   help='EMA decay for the diffusion weights (default 0.999; '
+                        '0 disables). The averaged weights are what infer_volume '
+                        'loads.')
+    p.add_argument('--diffusion_beta1', type=float, default=None,
+                   help='Adam beta1 on the diffusion path (default 0.9; the '
+                        'project-wide 0.5 is a GAN inheritance)')
     p.add_argument('--lambda_nll', type=float, default=None,
                    help='weight of the Gaussian NLL term (--use_hetero)')
 
@@ -197,6 +240,7 @@ def _apply(cfg: dict, args) -> dict:
     if args.batch_size  is not None: c['batch_size']   = args.batch_size
     if args.lr          is not None: c['learning_rate']= args.lr
     if args.output_dir  is not None: c['output_dir']   = Path(args.output_dir)
+    if args.data_dir    is not None: c['data_dir']     = args.data_dir
     if args.patch_size  is not None: c['patch_size']   = args.patch_size
     if args.patch_depth is not None: c['patch_depth']  = args.patch_depth
     if args.dims        is not None: c['dims']         = args.dims
@@ -217,15 +261,19 @@ def _apply(cfg: dict, args) -> dict:
     if args.cond_organs is not None:
         c['cond_organs'] = args.cond_organs
     for k in ['selection_metric', 'sample_mode', 'sample_n', 'max_train_cases',
-              'phase_cond_dim',
+              'phase_cond_dim', 'augment', 'organ_focus_frac', 'organ_focus_labels',
               'lambda_organ', 'lambda_hu_profile', 'lambda_l1_floor',
               'l1_decay_start_epoch', 'l1_decay_end_epoch',
               'seed', 'data_seed',
               'parameterisation', 'diffusion_steps', 'cfg_drop_prob',
-              'aux_max_t', 'diffusion_sample_every', 'lambda_nll']:
+              'aux_max_t', 'diffusion_sample_every', 'diffusion_selection',
+              'diffusion_offset_noise', 'min_snr_gamma', 'ema_decay',
+              'lambda_nll']:
         v = getattr(args, k, None)
         if v is not None:
             c[k] = v
+    if getattr(args, 'diffusion_beta1', None) is not None:
+        c['diffusion_betas'] = (args.diffusion_beta1, c['diffusion_betas'][1])
     for flag in ['ssim', 'gradient', 'frequency', 'organ',
                  'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond',
                  'hetero', 'diffusion']:
@@ -292,7 +340,23 @@ def main():
     log.info(f'{kind} NCCT → CECT')
     log.info('=' * 65)
     log.info(f"Output     : {out}")
+    log.info(f"Data       : {config['data_dir']}")
     log.info(f"Device     : {config['device']}")
+
+    # A relative data_dir resolves against the process cwd, which is not the same
+    # thing as the repo root once a run is launched from a scheduler, a different
+    # shell, or a copied tree. That cost a full run on 2026-07-31, and it fails
+    # SILENTLY: find_pairs_and_split just returns fewer cases, so the split shifts
+    # and the run is no longer comparable to anything.
+    _dd = Path(config['data_dir'])
+    if not _dd.is_absolute():
+        log.warning(f"data_dir is RELATIVE ({_dd}) and resolves against cwd "
+                    f"{Path.cwd()} → {_dd.resolve()}. Pass --data_dir with an "
+                    f"absolute path, or fix config.DATA_DIR.")
+    if not _dd.exists():
+        raise FileNotFoundError(
+            f"data_dir does not exist: {_dd} (resolved to {_dd.resolve()}). "
+            f"Fail here rather than train on a silently smaller split.")
 
     # If we asked for CUDA but it isn't usable, fall back to CPU rather than
     # crashing — and warn loudly, since this is exactly the "silently on CPU"
@@ -331,7 +395,12 @@ def main():
                                    'organ', 'hu_profile']
                        if config.get(f'use_{f}')]
     log.info(f"Losses     : {' + '.join(active)}")
-    log.info(f"Selection  : {config.get('selection_metric', 'val_org_ssim')}")
+    if config.get('use_diffusion'):
+        log.info(f"Selection  : diffusion_selection="
+                 f"{config.get('diffusion_selection', 'detail')} "
+                 f"(selection_metric is not consulted on this path)")
+    else:
+        log.info(f"Selection  : {config.get('selection_metric', 'val_org_ssim')}")
 
     if config.get('use_diffusion') and config.get('use_hetero'):
         raise SystemExit(

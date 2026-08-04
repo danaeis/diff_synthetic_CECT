@@ -8,6 +8,29 @@ Companions in this repo: `IMPLEMENTATION.md` (what the code does),
 roadmap and results live in `../synthetic_CECT/PROJECT_PLAN.md` (and `PLAN_FA.md`,
 Persian) — that repo is frozen.
 
+> **Status update.** This document is the plan as written *before* any diffusion
+> run existed. Six now do, and all of them plateaued. What that diagnosis found —
+> and the changes made in response (offset noise, EMA, SNR loss weighting,
+> detail-based checkpoint selection, augmentation) — is recorded in
+> `IMPLEMENTATION.md` §2a, §5a and §7a, not here. The plan below is unedited and
+> still describes the intended experiment.
+>
+> Two things in it are now known to need qualification:
+>
+> - **§7's expectation table is not falsifiable as written.** It predicts a
+>   single-sample featHU ~1.41x worse than 13.46 and says "not a failure". The
+>   observed val MAE ratio is 1.42. But the *same* number is what a model that
+>   simply copies its input would produce, and the measured samples of `diff_v`,
+>   `diff_x0` and `diff_v_nocfg` are all closer to the NCCT than the NCCT is to
+>   the CECT. Only `raps_hf` and the variance ratio separate those two readings,
+>   and **neither has ever been computed for a diffusion run** — `phase_infer/`
+>   is empty for all six. That measurement is the gate; nothing in §6's ordering
+>   should proceed before it.
+> - **The per-voxel metrics cannot rank these models.** MAE/PSNR/SSIM are
+>   minimised by the conditional mean, so they score a blurry copy above a
+>   correctly-textured sample. Sorting the ten existing runs by val MAE sorts
+>   them by how much texture each attempts, in the wrong direction.
+
 ---
 
 ## 1. The task, in one screen

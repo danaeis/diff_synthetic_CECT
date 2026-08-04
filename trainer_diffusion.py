@@ -44,10 +44,17 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from losses import OrganHUProfileLoss, OrganWeightedLoss
-from models_diffusion import (DDIMSampler, build_diffusion, from_model, to_model)
-from trainer import Trainer, _center_flat, _metric_set, _METRICS, _MIN_MASK_VOXELS
+from models_diffusion import (DDIMSampler, build_diffusion, from_model,
+                              offset_noise, to_model)
+from trainer import (Trainer, _center_2d, _center_flat, _detail_metric_set,
+                     _metric_set, _METRICS, _MIN_MASK_VOXELS)
 
 log = logging.getLogger(__name__)
+
+# Added to a provisional (val_loss-based) selection score so that ANY real
+# detail score beats it. The detail score is |raps_hf - 1| + gradW1, both O(1),
+# so 1e6 is unreachable from below.
+_PROVISIONAL_SELECTION_OFFSET = 1e6
 
 
 class DiffusionTrainer(Trainer):
@@ -78,7 +85,16 @@ class DiffusionTrainer(Trainer):
         self.G = self.G.to(self.device)
         self.schedule = self.schedule.to(self.device)
 
-        betas = config.get('betas', (0.5, 0.999))
+        # beta1 0.9, not the project-wide 0.5. `BETAS = (0.5, 0.999)` is inherited
+        # from the GAN baseline, where a short momentum window keeps the generator
+        # responsive to a moving discriminator. There is no discriminator here:
+        # the diffusion objective is stationary and its per-step gradient is
+        # dominated by which timestep was drawn, so a longer momentum window is
+        # what averages that away. 0.9 is the DDPM/ADM standard.
+        # The project-wide `betas` key is NOT consulted here — it is always
+        # present, so falling back to it would silently keep 0.5. Set
+        # `diffusion_betas` (or --diffusion_beta1) to reproduce the old runs.
+        betas = tuple(config.get('diffusion_betas') or (0.9, 0.999))
         self.opt_G = optim.Adam(
             self.G.parameters(),
             lr           = config.get('learning_rate', 2e-4),
@@ -122,6 +138,22 @@ class DiffusionTrainer(Trainer):
         self.aux_max_t = int(config.get('aux_max_t',
                                         int(0.7 * config.get('diffusion_steps', 1000))))
 
+        # Scale of the per-item DC component added to the training noise. See
+        # models_diffusion.offset_noise for the 2.3-HU-vs-24.4-HU argument. Must
+        # match what infer_volume.DiffusionPredictor uses at sampling time, which
+        # is why it is recorded in run_config.json and read back from there.
+        self.offset_noise = float(config.get('diffusion_offset_noise', 0.0))
+
+        # 0 disables. See NoiseSchedule.min_snr_weight.
+        self.min_snr_gamma = float(config.get('min_snr_gamma', 0.0))
+
+        # 0 disables. Every val pass, every sample grid and the checkpoint's
+        # G_state use the averaged weights; the live weights are kept in
+        # G_raw_state so a resume is still exact. See trainer.WeightEMA.
+        from trainer import WeightEMA
+        ema_decay = float(config.get('ema_decay', 0.0))
+        self.ema = WeightEMA(self.G, ema_decay) if ema_decay > 0 else None
+
         self.use_amp = config.get('use_mixed_precision', True) and self.device == 'cuda'
         self.scaler_G = GradScaler('cuda', enabled=self.use_amp)
 
@@ -131,6 +163,11 @@ class DiffusionTrainer(Trainer):
         from trainer import EarlyStopping
         self.early_stop = EarlyStopping(config.get('early_stop_patience', 30))
         self._warned_selection = False
+        # 'detail' | 'val_loss'. See _selection_score for why the default moved
+        # off the denoising MSE. `selection_metric` is not consulted on this
+        # path at all — it names deterministic-only metrics.
+        self.selection_mode = config.get('diffusion_selection', 'detail')
+        self._have_detail_score = False
 
         self.history: Dict[str, List] = {k: [] for k in [
             'epoch', 'lr_gen', 'lambda_l1',
@@ -139,6 +176,7 @@ class DiffusionTrainer(Trainer):
             'val_loss',
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',
+            'val_raps_hf', 'val_grad_w1', 'val_org_grad_w1', 'val_sampled',
         ] + [f'gamma_{s}' for s in ('enc1', 'enc2', 'enc3', 'enc4', 'bottleneck',
                                     'dec4', 'dec3', 'dec2', 'dec1')]}
 
@@ -180,7 +218,18 @@ class DiffusionTrainer(Trainer):
 
         out = self.G(x_t, cond, t, phase, level)
         tgt = self.schedule.to_target(x0, noise, t, self.param)
-        mse = F.mse_loss(out, tgt)
+        if self.min_snr_gamma:
+            # Flattens the objective in x0 space, so both parameterisations
+            # optimise the same thing and the low-t steps stop dominating. On
+            # this schedule plain v-MSE weights the x0 error at t=0 24,000x more
+            # than at t=999 — and t=999 is where the case-level HU offset is
+            # decided. See NoiseSchedule.snr_loss_weight, including why this is
+            # NOT the published min-SNR-gamma target.
+            w = self.schedule.snr_loss_weight(t, self.min_snr_gamma, self.param)
+            w = w.reshape((-1,) + (1,) * (out.ndim - 1))
+            mse = (w * (out - tgt) ** 2).mean()
+        else:
+            mse = F.mse_loss(out, tgt)
         total = mse
         d = {'mse': float(mse.detach()), 'organ': 0.0, 'hu_profile': 0.0}
 
@@ -189,7 +238,17 @@ class DiffusionTrainer(Trainer):
             # written and weighted for — their lambdas were sized against
             # normalised HU (config.py's LAMBDA_HU_PROFILE comment), and feeding
             # them [-1,1] would double every residual.
-            x0_hat = from_model(self.schedule.predict_x0(out, x_t, t, self.param))
+            # clip=False, unlike the sampler. `predict_x0` defaults to clamping
+            # to [-1,1], which is right when the estimate is fed back into the
+            # next DDIM step but wrong in a LOSS: clamp() has zero gradient
+            # outside the range, so every saturated voxel silently contributed
+            # nothing to the organ / HU-profile terms. At moderate-to-high t a
+            # large fraction of x0_hat is saturated, so the aux gradient was
+            # being masked far more aggressively than the documented t < 700
+            # gate — and the organ losses are the only terms in the diffusion
+            # objective that know about anatomy at all.
+            x0_hat = from_model(
+                self.schedule.predict_x0(out, x_t, t, self.param, clip=False))
             tgt01 = from_model(x0)
             keep = (t < self.aux_max_t)
             if keep.any():
@@ -214,7 +273,7 @@ class DiffusionTrainer(Trainer):
 
         B = source.shape[0]
         t = torch.randint(0, self.schedule.n_steps, (B,), device=self.device)
-        noise = torch.randn_like(target)
+        noise = offset_noise(target, self.offset_noise)
 
         self.opt_G.zero_grad()
         with autocast('cuda', enabled=self.use_amp):
@@ -225,6 +284,9 @@ class DiffusionTrainer(Trainer):
         nn.utils.clip_grad_norm_(self.G.parameters(), 10.0)
         self.scaler_G.step(self.opt_G)
         self.scaler_G.update()
+        if self.ema is not None:
+            # After the step, so the average is over post-update iterates.
+            self.ema.update(self.G)
 
         self.global_step += 1
         return {
@@ -249,13 +311,31 @@ class DiffusionTrainer(Trainer):
         if self._val_fixed is None or self._val_fixed['n'] != n_items:
             g = torch.Generator(device='cpu').manual_seed(self._val_seed)
             t = torch.linspace(0, self.schedule.n_steps - 1, n_items).round().long()
-            noise = torch.randn(n_items, *shape, generator=g)
+            # Same noise distribution as the train step, offset included: a val
+            # loss computed against plain randn while training uses offset noise
+            # measures a distribution the model is not being fit to.
+            noise = offset_noise(torch.empty(n_items, *shape), self.offset_noise,
+                                 generator=g)
             self._val_fixed = {'n': n_items, 't': t, 'noise': noise}
         return self._val_fixed
 
     @torch.no_grad()
     def _validate(self, val_loader: DataLoader) -> Dict:
         """Deterministic denoising loss + (periodically) sampled organ metrics.
+
+        Runs under the EMA weights when EMA is on, so the curves, the sample
+        grids and the checkpoint that inference loads all describe one set of
+        weights. Validating the live iterate while shipping the average would
+        mean selecting a checkpoint on a model that is never used.
+        """
+        if self.ema is not None:
+            with self.ema.swapped(self.G):
+                return self._validate_weights(val_loader)
+        return self._validate_weights(val_loader)
+
+    @torch.no_grad()
+    def _validate_weights(self, val_loader: DataLoader) -> Dict:
+        """The body of `_validate`, on whatever weights are currently loaded.
 
         The returned dict keeps the parent's key names so `_update_history`,
         `_selection_score` and the plots need no special-casing. `val_loss` is
@@ -289,7 +369,9 @@ class DiffusionTrainer(Trainer):
         out = {
             'val_loss': float(np.mean(losses)) if losses else 0.0,
             'val_mae': 0.0, 'val_psnr': 0.0, 'val_ssim': 0.0, 'val_ncc': 0.0,
+            'val_raps_hf': 0.0, 'val_grad_w1': 0.0, 'val_org_grad_w1': 0.0,
             'n_organ_items': 0,
+            'val_sampled': 0.0,
         }
         for m in _METRICS:
             out[f'val_org_{m}'] = 0.0
@@ -298,10 +380,14 @@ class DiffusionTrainer(Trainer):
         if (self.current_epoch % max(1, self.sample_every) == 0
                 or self.current_epoch == self.cfg.get('epochs', 0)):
             out.update(self._sampled_metrics(val_loader))
+            out['val_sampled'] = 1.0
         elif self._last_sampled:
             # Carry the last sampled values forward so the curves are continuous
             # instead of dropping to zero between sampling epochs. They are
-            # STALE, not fresh — never used for selection, which reads val_loss.
+            # STALE, not fresh — `val_sampled` stays 0.0 so `_plot_history` draws
+            # them as a faint connecting line and puts a marker only on the
+            # epochs actually measured. Without that flag these rows read as
+            # 10-epoch plateaus in curves.png that no model behaviour produced.
             out.update(self._last_sampled)
 
         self.G.train()
@@ -334,12 +420,16 @@ class DiffusionTrainer(Trainer):
 
         glob = {m: [] for m in _METRICS}
         org = {m: [] for m in _METRICS}
+        d_pred, d_tgt, d_mask = [], [], []
         for i in range(fake.shape[0]):
+            d_pred.append(_center_2d(fake[i]))
+            d_tgt.append(_center_2d(tgt[i]))
             p = _center_flat(fake[i]).astype(np.float64)
             t_ = _center_flat(tgt[i]).astype(np.float64)
             for m, v in _metric_set(p, t_).items():
                 glob[m].append(v)
             if mask is not None:
+                d_mask.append(_center_2d(mask[i]))
                 mk = _center_flat(mask[i]) > 0
                 if mk.sum() >= _MIN_MASK_VOXELS:
                     for m, v in _metric_set(p[mk], t_[mk]).items():
@@ -349,6 +439,9 @@ class DiffusionTrainer(Trainer):
         res = {f'val_{m}': _mean(glob[m]) for m in _METRICS}
         res.update({f'val_org_{m}': _mean(org[m]) for m in _METRICS})
         res['n_organ_items'] = len(org['mae'])
+        # The detail axis, on the DDIM sample rather than a forward pass — a
+        # one-step denoise would score as pure blur regardless of the model.
+        res.update(_detail_metric_set(d_pred, d_tgt, d_mask or None))
         self._last_sampled = dict(res)
         # The sample grid is drawn from the same tensors, so it shows exactly the
         # patches these numbers describe.
@@ -356,15 +449,71 @@ class DiffusionTrainer(Trainer):
         return res
 
     # -----------------------------------------------------------------------
-    def _selection_score(self, val: Dict) -> float:
-        """MINIMISE the deterministic denoising loss.
+    def _selection_label(self) -> str:
+        if self.selection_mode == 'detail':
+            return 'selection: |raps_hf-1| + org gradW1 (sampled epochs only)'
+        return 'selection: val_loss (denoising MSE)'
 
-        NOT `val_org_ssim`, the parent's default: that needs a deterministic
-        forward pass, and the sampled version of it is only computed every
-        `diffusion_sample_every` epochs, so selecting on it would compare fresh
-        values against stale carried-forward ones. The denoising loss is
-        available every epoch, is deterministic by construction (see
-        `_fixed_val`), and is the standard diffusion selection signal.
+    def _selection_score(self, val: Dict) -> float:
+        """MINIMISE, on sampling epochs only under `diffusion_selection=detail`.
+
+        `val_loss` — the denoising MSE — is available every epoch and is
+        deterministic by construction (`_fixed_val`), which is why it was the
+        original choice. But it is a per-voxel loss, and every per-voxel loss is
+        minimised by the conditional mean: selecting on it picks the epoch whose
+        samples are BLURREST. That is the defect this project is trying to fix,
+        so it cannot also be the checkpoint rule.
+
+        `detail` mode scores what the samples actually look like:
+
+            |raps_hf - 1|  +  val_org_grad_w1
+
+        raps_hf is a ratio (1.0 = the real CECT's high-frequency amplitude; <1
+        blur, >1 hallucinated noise) so it is scored as a distance from 1. The
+        organ-region gradW1 is a distance already, and is restricted to the
+        anatomy that matters rather than to the body wall and air that dominate
+        a whole-patch metric. Both come from the DDIM sample, so both exist only
+        on sampling epochs — a stale row returns +inf and is simply not a
+        candidate, rather than being compared against a fresh one.
+
+        Early stopping does NOT use this (see `_early_stop_score`): patience has
+        to count on a signal that exists every epoch.
+        """
+        if self.selection_mode != 'detail':
+            return float(val['val_loss'])
+
+        raps = val.get('val_raps_hf') or 0.0
+        gw1 = val.get('val_org_grad_w1') or val.get('val_grad_w1') or 0.0
+        if val.get('val_sampled') and raps > 0.0:
+            self._have_detail_score = True
+            return abs(raps - 1.0) + float(gw1)
+
+        if self._have_detail_score:
+            return float('inf')                  # stale row: not a candidate
+
+        # No sampled epoch has happened YET. Returning +inf here would mean a run
+        # whose sampling cadence never fires (diffusion_sample_every > epochs, or
+        # a crash before the first sample) finishes with no best_model.pth at all
+        # — and infer_volume.py requires that file, so the run would be dead
+        # without ever having said so. Fall back to the denoising loss, offset far
+        # enough that the first REAL detail score always supersedes it.
+        if not self._warned_selection:
+            log.warning(
+                "diffusion_selection='detail' but no DDIM sample has been taken "
+                "yet — best_model.pth is provisionally selected on val_loss and "
+                "will be replaced at the first sampling epoch. If "
+                f"diffusion_sample_every ({self.sample_every}) exceeds the epoch "
+                "count, that never happens and selection stays on val_loss.")
+            self._warned_selection = True
+        return _PROVISIONAL_SELECTION_OFFSET + float(val['val_loss'])
+
+    def _early_stop_score(self, val: Dict, selection_score: float) -> float:
+        """Patience counts against the denoising loss, which exists every epoch.
+
+        Under `detail` selection the selection score is +inf on the ~90% of
+        epochs that carry no fresh sample; counting patience against that would
+        stop every run after `early_stop_patience` epochs regardless of how it
+        was training.
         """
         return float(val['val_loss'])
 

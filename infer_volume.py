@@ -277,6 +277,11 @@ class DiffusionPredictor(PatchPredictor):
                             else (int(ps[0]), int(ps[1])))
         self.sample_seed = int(sample_seed)
         self.case_id = case_id
+        # Read from the run's own config, never from a CLI default: a checkpoint
+        # trained with offset noise and sampled without it (or the reverse) is a
+        # train/test mismatch in the one channel this project measures, and it
+        # would look like a modelling result rather than a flag.
+        self.offset_noise = float(cfg.get('diffusion_offset_noise', 0.0))
         self.k = 0
         self._shape = None
         self._noise = None
@@ -302,6 +307,19 @@ class DiffusionPredictor(PatchPredictor):
         # Built on CPU and kept there: a full-volume float32 field is ~80 MB and
         # only one tile's worth is needed on the device at a time.
         self._noise = torch.randn(self._shape, generator=g, dtype=torch.float32)
+        if self.offset_noise:
+            # ONE constant for the entire padded volume, not one per tile. Every
+            # tile of a case therefore crops the same DC offset and they all
+            # agree on the contrast level — the same coherence argument that
+            # makes the field volume-wide at all (see the module docstring).
+            # Per-tile offsets would give each tile its own level, average the
+            # case-level offset away across ~49 tiles per slice, and leave the
+            # variance ratio near 0.176 for a plumbing reason.
+            #
+            # Drawn from the same generator, after the field, so (sample_seed,
+            # case_id, k) still reproduces the draw exactly.
+            off = torch.randn((1,), generator=g, dtype=torch.float32)
+            self._noise = self._noise + self.offset_noise * off
 
     def _x_T(self, coords) -> torch.Tensor:
         crops = []
@@ -522,6 +540,49 @@ def organ_medians(vol_hu: np.ndarray, mask: np.ndarray,
 # Driver
 # ---------------------------------------------------------------------------
 
+def _dry_run(sdir: Path, cfg: Dict, pairs: List[Dict], split: str, device: str,
+             overlap: Optional[float], ddim_steps: int, n_samples: int,
+             guidance: float):
+    """Tile count and sampling budget, without touching the model.
+
+    Deliberately reachable WITHOUT a checkpoint. Tile counts come from the source
+    volume shapes and the run config alone, and the whole point of "run --dry_run
+    first" is to size the budget before committing to it — which has to work while
+    the run is still training, or before you have decided which checkpoint to
+    sample with. It used to sit after `load_model`, so the one instruction the
+    docs give as a pre-flight check needed the thing it was meant to precede.
+    """
+    kind = ('diffusion' if cfg.get('use_diffusion') else
+            'hetero' if cfg.get('use_hetero') else 'deterministic')
+    ov = overlap if overlap is not None else cfg.get('overlap', 0.5)
+    log.info(f"[dry run] {len(pairs)} {split} case(s) for scenario '{sdir.name}' "
+             f"[{kind}] at overlap={ov}")
+
+    total = n_skipped = 0
+    for pair in pairs:
+        if not pair.get('seg_path'):
+            n_skipped += 1          # same skip rule as the real loop
+            continue
+        src_dhw = _load_vol(pair['source_path'])
+        n_tiles, per_slice = infer_volume(PatchPredictor(), src_dhw, cfg, device,
+                                          overlap=overlap, count_only=True)
+        total += n_tiles
+        log.info(f"  {pair['case_id']}: shape {src_dhw.shape} → {n_tiles} tiles "
+                 f"({per_slice} per slice)")
+
+    # For a deterministic or hetero run a tile IS a forward pass. For diffusion the
+    # budget is the number that decides whether the run is affordable at all.
+    if kind == 'diffusion':
+        passes = total * ddim_steps * n_samples * (2 if guidance != 1.0 else 1)
+        log.info(f"[dry run] {total} tiles → {passes:,} forward passes "
+                 f"(x{ddim_steps} ddim_steps x{n_samples} n_samples"
+                 + (", x2 for guidance != 1" if guidance != 1.0 else "") + ")")
+    else:
+        log.info(f"[dry run] {total} tiles → {total:,} forward passes")
+    if n_skipped:
+        log.info(f"[dry run] {n_skipped} case(s) skipped: no organ mask")
+
+
 def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         batch_size: int, device: str, blend: str = 'hann',
         edge_margin: int = 0, overlap: Optional[float] = None,
@@ -531,6 +592,16 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         dry_run: bool = False):
     sdir = Path(scenario_dir)
     cfg = json.loads((sdir / 'run_config.json').read_text())
+
+    train_pairs, val_pairs, test_pairs = find_pairs_and_split(cfg)
+    pairs = {'val': val_pairs, 'test': test_pairs,
+             'both': val_pairs + test_pairs}[split]
+
+    if dry_run:
+        _dry_run(sdir, cfg, pairs, split, device, overlap, ddim_steps, n_samples,
+                 guidance)
+        return
+
     ckpt = sdir / ckpt_name
     if not ckpt.exists():
         raise FileNotFoundError(f"checkpoint not found: {ckpt}")
@@ -538,9 +609,6 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
     model, kind, schedule = load_model(str(ckpt), cfg, device)
     use_amp = (device == 'cuda')
 
-    train_pairs, val_pairs, test_pairs = find_pairs_and_split(cfg)
-    pairs = {'val': val_pairs, 'test': test_pairs,
-             'both': val_pairs + test_pairs}[split]
     log.info(f"Inferring {len(pairs)} {split} case(s) for scenario '{sdir.name}' "
              f"[{kind}]")
 
@@ -619,14 +687,6 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         common = dict(cfg=cfg, device=device, batch_size=batch_size, blend=blend,
                       edge_margin=edge_margin, overlap=overlap)
 
-        if dry_run:
-            n_tiles, per_slice = infer_volume(PatchPredictor(), src_dhw, cfg, device,
-                                              overlap=overlap, count_only=True)
-            log.info(f"  {case_id}: shape {src_dhw.shape} → {n_tiles} tiles "
-                     f"({per_slice} per slice) at overlap="
-                     f"{overlap if overlap is not None else cfg.get('overlap', 0.5)}")
-            continue
-
         if kind == 'diffusion':
             pred = DiffusionPredictor(model, schedule, device, use_amp, cfg,
                                       ddim_steps=ddim_steps, eta=eta,
@@ -681,9 +741,6 @@ def run(scenario_dir: str, split: str, out_dir: str, ckpt_name: str,
         rows_by_phase[ph].append({'gen_path': str(pdir / f'{case_id}_syn.nii.gz'),
                                   'real_path': pair['target_path'],
                                   'mask_path': seg_path, 'target_phase': ph})
-
-    if dry_run:
-        return
 
     for ph, rows in rows_by_phase.items():
         pdir = (out / ph) if multi else out
@@ -779,8 +836,10 @@ def main():
                    help='also write every individual sample volume — needed for '
                         'the per-voxel block of calibration_eval.py.')
     ap.add_argument('--dry_run', action='store_true',
-                    help='print the tile count per volume and exit. Run this '
-                         'FIRST: the sampling cost estimate depends on it.')
+                    help='print the tile count per volume and the total forward-pass '
+                         'budget, then exit. Run this FIRST: the sampling cost '
+                         'estimate depends on it. Needs only run_config.json and the '
+                         'data — NOT a checkpoint, so it works mid-training.')
     args = ap.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

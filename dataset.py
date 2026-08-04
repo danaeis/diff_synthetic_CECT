@@ -23,7 +23,8 @@ import functools
 import hashlib
 import json
 import logging
-from random import random
+import os
+import random
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +40,29 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 log = logging.getLogger(__name__)
+
+# Geometric augmentation modes. See CTPairDataset._augment for what each does and
+# for why no intensity mode exists.
+#   'none'       byte-identical patches every epoch (the original behaviour)
+#   'flip_ap'    anterior-posterior flip only; laterality untouched
+#   'flip'       AP + left-right flip
+#   'flip_rot90' the above plus a multiple of 90 degrees in-plane
+_AUGMENT_MODES = ('none', 'flip_ap', 'flip', 'flip_rot90')
+
+
+def _stat_key(paths) -> List:
+    """(path, size, mtime_ns) per file, sorted — a cheap content proxy for the
+    patch-cache key. A missing file contributes None rather than raising: the
+    indexing pass reports missing data far better than a hash function can, and
+    a cache keyed on "this file was absent" is still a correct distinct key."""
+    out = []
+    for p in sorted(set(map(str, paths))):
+        try:
+            st = os.stat(p)
+            out.append([p, st.st_size, st.st_mtime_ns])
+        except OSError:
+            out.append([p, None, None])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +341,13 @@ class CTPairDataset(Dataset):
         self.organ_focus_frac   = float(cfg.get('organ_focus_frac', 0.0))
         self.organ_focus_labels = cfg.get('organ_focus_labels', None)
         self.max_focus_cand     = int(cfg.get('max_focus_candidates_per_vol', 3000))
+
+        # Augmentation. TRAIN SPLIT ONLY — augmenting val makes the metric a
+        # different random variable every epoch and the selection curve unreadable.
+        # See _augment for what each mode does and why intensity jitter is absent.
+        self.augment = str(cfg.get('augment', 'none')) if split_name == 'train' else 'none'
+        if self.augment not in _AUGMENT_MODES:
+            raise ValueError(f"augment={self.augment!r} not in {_AUGMENT_MODES}")
 
         # Organ/vessel mask is only loaded from disk if a loss that consumes it
         # is enabled, OR organ-focused sampling needs it to place patch centres,
@@ -675,7 +706,19 @@ class CTPairDataset(Dataset):
         if not cache_dir:
             return None
         key_data = {
+            # Path strings AND (size, mtime) of every file. Paths alone hash the
+            # NAME of the data, not the data: regenerating B2_deeds__aligned in
+            # place — re-running deeds with different parameters, fixing an
+            # alignment bug, re-exporting the NIfTIs — leaves every path
+            # identical, so the digest would not move and every later scenario
+            # would silently train on the OLD registration while reporting the
+            # new config. The whole question this project asks is downstream of
+            # registration quality, so that failure would be invisible and total.
+            # Content hashing 274 volumes per run is too slow; (size, mtime) is
+            # the standard cheap proxy and catches every realistic regeneration.
             'pairs':        sorted((p['source_path'], p['target_path']) for p in pairs),
+            'pair_stat':    _stat_key(p for pair in pairs
+                                      for p in (pair['source_path'], pair['target_path'])),
             'patch_h':      self.ph,
             'patch_w':      self.pw,
             'patch_depth':  self.patch_depth,
@@ -721,6 +764,68 @@ class CTPairDataset(Dataset):
     def __len__(self) -> int:
         return len(self.src_patches)
 
+    def _augment(self, item: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Paired geometric augmentation of source / target / mask.
+
+        The cache is a FIXED set of patches — `__getitem__` is a list lookup and
+        every epoch sees byte-identical tensors — so 200 epochs over 20k patches
+        from 97 cases is 200 passes over one small dataset. The measured cost is
+        a ~2x train/val gap (`memorize97`: train MAE 0.0086 vs val 0.0157).
+
+        Three rules this obeys:
+
+        1. **The same transform is applied to source, target and mask.** The
+           decisions are drawn once per item, not per key.
+        2. **In-plane axes are always the last two.** That is true for 2-D
+           `(1,H,W)`, 2.5-D `(2k+1,H,W)` where axis 0 is the slice stack, and 3-D
+           `(1,D,H,W)`. Nothing is ever flipped through-plane: z ordering is
+           anatomy, not a symmetry.
+        3. **No intensity jitter, at all.** The prediction target IS an absolute
+           HU level (see analysis/BASELINE_REFERENCE.md — case-to-case aortic
+           spread is sd 24.4 HU, and recovering it is the whole point). Jittering
+           the target destroys the label; jittering only the source teaches the
+           model the level is unrelated to the input. A *paired* offset applied
+           identically to both is the only intensity transform that is safe here,
+           and it is deliberately not implemented rather than left as a footgun.
+
+        `torch.flip`/`torch.rot90` return copies, so the cached numpy arrays that
+        `torch.from_numpy` aliases are never written through.
+
+        Laterality: 'flip' includes the left-right axis, which produces
+        anatomically impossible (situs-inversus) images. It is consistent — the
+        NCCT, the CECT and the organ mask are all mirrored together, so the
+        structure→enhancement pairing the model learns is unchanged — but it does
+        widen the prior over anatomy. 'flip_ap' is the conservative mode that
+        leaves laterality alone.
+        """
+        mode = self.augment
+        if mode == 'none':
+            return item
+        # Drawn from torch's RNG: DataLoader re-seeds it per worker, so this is
+        # correct at num_workers > 0. `_worker_init` seeds `np.random` and the
+        # stdlib `random` instead, and dataset.py imports `random.random` (the
+        # function) rather than the module, so `random.seed` there would raise —
+        # latent only because NUM_WORKERS is 0.
+        flip_lr = mode in ('flip', 'flip_rot90') and bool(torch.randint(2, (1,)).item())
+        flip_ap = bool(torch.randint(2, (1,)).item())
+        k = int(torch.randint(4, (1,)).item()) if mode == 'flip_rot90' else 0
+
+        def _apply(t: torch.Tensor) -> torch.Tensor:
+            if flip_ap:
+                t = torch.flip(t, dims=[-2])
+            if flip_lr:
+                t = torch.flip(t, dims=[-1])
+            # rot90 needs a square in-plane patch; patch_size is square today but
+            # a non-square override would silently change tensor shapes mid-batch.
+            if k and t.shape[-1] == t.shape[-2]:
+                t = torch.rot90(t, k, dims=(-2, -1))
+            return t.contiguous()
+
+        for key in ('source', 'target', 'mask'):
+            if key in item:
+                item[key] = _apply(item[key])
+        return item
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         # 2.5-D source patches are already (2k+1, H, W) — the slice stack IS the
         # channel axis, so no unsqueeze. Everything else gets a channel axis added.
@@ -739,7 +844,8 @@ class CTPairDataset(Dataset):
             item['level'] = torch.as_tensor(self.level_vecs[idx], dtype=torch.float32)
         if self.mask_patches:
             item['mask'] = torch.from_numpy(self.mask_patches[idx]).unsqueeze(0)
-        return item
+        # After the mask is attached, so it gets the identical transform.
+        return self._augment(item)
 
     # -----------------------------------------------------------------------
     def _save_patch_grid(self, out_dir, split_name: str, n: int = 16):
