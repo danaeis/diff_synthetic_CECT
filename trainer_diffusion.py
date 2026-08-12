@@ -27,6 +27,41 @@ each one is a decision rather than plumbing:
    there to be looked at, and to catch a model whose loss falls while its samples
    fall apart.
 
+4. OPTIONAL ADVERSARIAL TERM ON THE PREDICTED x0 (`use_adversarial`).
+   A discriminator needs an image, and a diffusion training step does not
+   produce one — it produces a regression target at one random noise level.
+   Running the sampler inside the step to get a real image is 25-1000 U-Net
+   forwards per iteration and is not affordable here. The image this uses
+   instead is the SAME one the organ losses already attach to: the closed-form
+   one-step estimate x0_hat = predict_x0(out, x_t, t), which costs nothing
+   because `out` has already been computed.
+
+   Four things make that workable, and all four are load-bearing:
+
+   a. D IS CONDITIONED ON t. x0_hat's sharpness is a monotone function of t, so
+      an unconditional critic solves the task by regressing the noise level and
+      the only way G can beat it is to invent texture at high t. See
+      models_disc.py.
+   b. THE TERM IS GATED TO t < `adv_max_t`. Same argument as `aux_max_t`, only
+      stronger: at high t the posterior over x0 is wide, x0_hat is a genuine
+      conditional MEAN, and "make the mean look like a sample" is a request to
+      be overconfident.
+   c. THE CLIP IS STRAIGHT-THROUGH, not `clamp`. Real x0 lives in [-1,1] and
+      unclipped x0_hat does not, which would hand D a free discriminating
+      feature that is about range rather than realism. A hard clamp fixes the
+      range and kills the gradient on exactly the saturated voxels that need it
+      — the mistake this repo already made once with the organ losses. So the
+      forward value is clamped and the gradient passes through.
+   d. λ_adv WARMS UP OVER `adv_warmup_epochs`. At epoch 1 an x0_hat at any
+      moderate t is visibly not a CT; D wins immediately and its gradient is
+      noise.
+
+   THIS IS NOT FREE, AND THE COST IS THE ONE THIS THESIS MEASURES. Sharpening a
+   posterior mean spends calibration. Report `var_ratio`, CRPS and coverage from
+   `benchmark.py` for the adversarial run against its non-adversarial twin
+   before claiming the term helped; a PSNR/SSIM table cannot see what it costs,
+   and per-voxel metrics will in fact get WORSE if the term is working.
+
 Everything is in the [-1,1] domain internally (`models_diffusion.to_model`); the
 dataset and every metric stay in [0,1].
 """
@@ -138,6 +173,17 @@ class DiffusionTrainer(Trainer):
         self.aux_max_t = int(config.get('aux_max_t',
                                         int(0.7 * config.get('diffusion_steps', 1000))))
 
+        # Adversarial term on the predicted x0 — see the module docstring, §4.
+        # The discriminator itself is built further down, after `use_amp` exists,
+        # because its GradScaler needs it.
+        # `or`, not a .get default: ADV_MAX_T is present-and-None in config.py,
+        # meaning "derive it", which a plain default would never see.
+        self.adv_max_t = int(config.get('adv_max_t')
+                             or 0.5 * config.get('diffusion_steps', 1000))
+        self.adv_clip_mode = config.get('adv_clip_mode', 'straight_through')
+        if self.adv_clip_mode not in ('straight_through', 'hard', 'none'):
+            raise ValueError(f"unknown adv_clip_mode {self.adv_clip_mode!r}")
+
         # Scale of the per-item DC component added to the training noise. See
         # models_diffusion.offset_noise for the 2.3-HU-vs-24.4-HU argument. Must
         # match what infer_volume.DiffusionPredictor uses at sampling time, which
@@ -157,6 +203,25 @@ class DiffusionTrainer(Trainer):
         self.use_amp = config.get('use_mixed_precision', True) and self.device == 'cuda'
         self.scaler_G = GradScaler('cuda', enabled=self.use_amp)
 
+        # ── discriminator (optional) ────────────────────────────────────────
+        # Built strictly inside its flag and after the generator, the same
+        # RNG-draw reason as everything else here. `use_t_cond=True` is not
+        # optional on this path — see the module docstring, §4a. `cond_dim` is
+        # the width of the generator's own conditioning space, which is what
+        # `_cond_for_d` produces for the phase/level half of D's conditioning.
+        self._init_adversarial(
+            config,
+            dims            = config.get('dims', 2),
+            source_channels = config.get('in_channels', 1),
+            cond_dim        = config.get('phase_cond_dim', 64),
+            use_t_cond      = True,
+        )
+        if self.D is not None and self.adv_max_t >= config.get('diffusion_steps', 1000):
+            log.warning(f"adv_max_t={self.adv_max_t} covers the whole schedule — "
+                        f"the critic will be asked to judge x0 estimates at t~T, "
+                        f"where they are conditional means, not samples. See "
+                        f"trainer_diffusion's module docstring, §4b.")
+
         self.global_step = 0
         self.current_epoch = 0
         self.best_val_loss = float('inf')
@@ -173,12 +238,14 @@ class DiffusionTrainer(Trainer):
             'epoch', 'lr_gen', 'lambda_l1',
             'train_gen_total', 'train_l1', 'train_nll',
             'train_ssim', 'train_grad', 'train_freq', 'train_organ', 'train_hu_profile',
+            'train_adv', 'train_fm', 'train_disc', 'lambda_adv',
             'val_loss',
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',
             'val_raps_hf', 'val_grad_w1', 'val_org_grad_w1', 'val_sampled',
         ] + [f'gamma_{s}' for s in ('enc1', 'enc2', 'enc3', 'enc4', 'bottleneck',
                                     'dec4', 'dec3', 'dec2', 'dec1')]}
+        self._hist_keys = list(self.history)
 
         self.per_organ = config.get('report_per_organ_metrics', False)
         self.organ_id_to_name = self._load_organ_id_map(config.get('organ_label_map_json'))
@@ -198,7 +265,10 @@ class DiffusionTrainer(Trainer):
                  f"sample every {self.sample_every} ep at {self.sample_steps} DDIM steps")
         log.info(f"Active losses: MSE({self.param})"
                  + (" + organ" if self.use_organ else "")
-                 + (" + hu_profile" if self.use_hu_profile else ""))
+                 + (" + hu_profile" if self.use_hu_profile else "")
+                 + (f" + adv(x0_hat, t<{self.adv_max_t}, "
+                    f"clip={self.adv_clip_mode})" if self.use_adv else "")
+                 + (" + feature_matching" if self.use_fm else ""))
 
     # -----------------------------------------------------------------------
     def _split_out(self, out):
@@ -209,8 +279,14 @@ class DiffusionTrainer(Trainer):
     def _diffusion_loss(self, source, target, mask, phase, level, t, noise):
         """Shared by the train step and the deterministic val pass.
 
-        Returns (total, dict). `t` and `noise` are passed in rather than drawn
-        here precisely so validation can hold them fixed.
+        Returns (total, dict, x0_hat) where x0_hat is the one-step estimate in
+        the MODEL domain [-1,1], or None when nothing asked for it. The train
+        step needs it for the adversarial term and must not recompute it — a
+        second `predict_x0` would be free of arithmetic error but would silently
+        diverge the moment the parameterisation changed in one place only.
+
+        `t` and `noise` are passed in rather than drawn here precisely so
+        validation can hold them fixed.
         """
         x0 = to_model(target)
         cond = to_model(source)
@@ -233,22 +309,29 @@ class DiffusionTrainer(Trainer):
         total = mse
         d = {'mse': float(mse.detach()), 'organ': 0.0, 'hu_profile': 0.0}
 
+        # clip=False, unlike the sampler. `predict_x0` defaults to clamping to
+        # [-1,1], which is right when the estimate is fed back into the next DDIM
+        # step but wrong in a LOSS: clamp() has zero gradient outside the range,
+        # so every saturated voxel silently contributes nothing. The adversarial
+        # branch re-applies the bound as a STRAIGHT-THROUGH clamp instead, which
+        # keeps D's input in range without throwing the gradient away.
+        need_x0 = (self.use_organ or self.use_hu_profile
+                   or self.D is not None)
+        x0_hat_m = (self.schedule.predict_x0(out, x_t, t, self.param, clip=False)
+                    if need_x0 else None)
+
         if (self.use_organ or self.use_hu_profile) and mask is not None:
             # Back to [0,1] so the organ losses see exactly the domain they were
             # written and weighted for — their lambdas were sized against
             # normalised HU (config.py's LAMBDA_HU_PROFILE comment), and feeding
             # them [-1,1] would double every residual.
-            # clip=False, unlike the sampler. `predict_x0` defaults to clamping
-            # to [-1,1], which is right when the estimate is fed back into the
-            # next DDIM step but wrong in a LOSS: clamp() has zero gradient
-            # outside the range, so every saturated voxel silently contributed
-            # nothing to the organ / HU-profile terms. At moderate-to-high t a
-            # large fraction of x0_hat is saturated, so the aux gradient was
-            # being masked far more aggressively than the documented t < 700
-            # gate — and the organ losses are the only terms in the diffusion
-            # objective that know about anatomy at all.
-            x0_hat = from_model(
-                self.schedule.predict_x0(out, x_t, t, self.param, clip=False))
+            #
+            # The unclipped estimate matters here specifically: at moderate-to-
+            # high t a large fraction of x0_hat is saturated, so a clamp would
+            # mask the aux gradient far more aggressively than the documented
+            # t < aux_max_t gate — and the organ losses are the only terms in the
+            # diffusion objective that know about anatomy at all.
+            x0_hat = from_model(x0_hat_m)
             tgt01 = from_model(x0)
             keep = (t < self.aux_max_t)
             if keep.any():
@@ -261,7 +344,106 @@ class DiffusionTrainer(Trainer):
                     d['hu_profile'] = float(h.detach());  total = total + h
 
         d['total'] = float(total.detach())
-        return total, d
+        return total, d, x0_hat_m
+
+    # -----------------------------------------------------------------------
+    def _adv_bound(self, x: torch.Tensor) -> torch.Tensor:
+        """Bound x0_hat to the valid image range for the critic's benefit.
+
+        'straight_through' (default): the value D sees is clamped to [-1,1] but
+        the gradient passes through unchanged. Real x0 is in [-1,1] by
+        construction and unclipped x0_hat is not, so without a bound D can
+        separate real from fake on RANGE, which has nothing to do with realism;
+        with a plain clamp the saturated voxels — the ones actually out of range,
+        i.e. exactly the ones the term should be correcting — receive zero
+        gradient. This is the same trap the organ losses fell into.
+        'hard' reproduces the naive clamp, 'none' disables the bound; both exist
+        to be ablated against, not used.
+        """
+        if self.adv_clip_mode == 'none':
+            return x
+        if self.adv_clip_mode == 'hard':
+            return x.clamp(-1.0, 1.0)
+        return x + (x.clamp(-1.0, 1.0) - x).detach()
+
+    def _cond_for_d(self, phase, level) -> Optional[torch.Tensor]:
+        """Phase/level conditioning for the DISCRIMINATOR — always DETACHED, and
+        deliberately WITHOUT the timestep.
+
+        D has its own timestep embedding (models_disc.py), so reusing the
+        generator's `cond_vec` here would sum t in twice, from two different
+        embeddings, one of which is being trained by a different objective.
+
+        The detach is not an optimisation. D is a critic; letting its gradients
+        reach the generator's phase/level embedding would let G lower the
+        adversarial loss by reshaping what it *claims* was requested instead of
+        by improving the image.
+        """
+        if not getattr(self.D, 'cond_dim', 0):
+            return None
+        parts = []
+        if getattr(self.G, 'use_phase_cond', False) and phase is not None:
+            parts.append(self.G.phase_emb(phase.reshape(-1).long()))
+        if getattr(self.G, 'n_levels', 0) and level is not None:
+            parts.append(self.G.level_proj(level.float()))
+        if not parts:
+            return None
+        return sum(parts).detach()
+
+    # -----------------------------------------------------------------------
+    def _adversarial_term(self, source, target, x0_hat_m, t, phase, level):
+        """The GAN half of the step. Returns (adv_loss_or_None, log_dict).
+
+        Everything is in the MODEL domain [-1,1] — both D's image input and, when
+        the D is conditional, the NCCT channel it is paired with. Feeding one in
+        [0,1] and the other in [-1,1] would give D a constant offset between the
+        two channels that separates nothing and confuses everything.
+        """
+        out = {'adv': 0.0, 'fm': 0.0, 'disc': 0.0, 'n_adv': 0}
+
+        # Gate to the low-t half of the schedule (§4b). The SAME subset goes to
+        # both D and G, and the same `t` goes to D's real and fake branches, so
+        # the critic can never separate them on their conditioning.
+        sel = (t < self.adv_max_t).nonzero(as_tuple=True)[0]
+        if sel.numel() == 0:
+            return None, out
+        out['n_adv'] = int(sel.numel())
+
+        real_m = to_model(target)[sel]
+        cond_m = to_model(source)[sel]
+        fake_m = self._adv_bound(x0_hat_m[sel])
+        t_sel  = t[sel]
+        dcond  = self._cond_for_d(phase, level)
+        if dcond is not None:
+            dcond = dcond[sel]
+
+        # D's update, and therefore D's backward, runs OUTSIDE any autocast
+        # region — `_disc_step` opens its own for the forward. Calling backward
+        # under autocast is what the PyTorch AMP docs tell you not to do, and it
+        # is easy to get wrong here because the caller is mid-step.
+        if self.global_step % self.disc_freq == 0:
+            out['disc'] = self._disc_step(real_m, fake_m.detach(),
+                                          source=cond_m, t=t_sel, cond=dcond)
+
+        # D is frozen here: the generator's backward has no business touching
+        # D's weights, and leaving it unfrozen would fill D's .grad with
+        # scaler_G-scaled values between its own updates.
+        term = None
+        lam = self._adv_w()
+        with autocast('cuda', enabled=self.use_amp), self._frozen_d():
+            logits, real_f, fake_f = self._disc_verdict(
+                fake_m, real=real_m, source=cond_m, t=t_sel, cond=dcond)
+            if self.use_adv and lam > 0:
+                adv = self.criterion_adv.gen_loss(logits) * lam
+                # RAW value, not the lambda-scaled contribution, so `train_adv`
+                # does not change units the moment the warmup finishes.
+                out['adv'] = float(adv.detach()) / lam
+                term = adv
+            if self.use_fm:
+                fm = self.fm_loss(real_f or [], fake_f) * self.lambda_fm
+                out['fm'] = float(fm.detach())
+                term = fm if term is None else term + fm
+        return term, out
 
     # -----------------------------------------------------------------------
     def _train_step(self, batch: Dict) -> Dict:
@@ -277,7 +459,23 @@ class DiffusionTrainer(Trainer):
 
         self.opt_G.zero_grad()
         with autocast('cuda', enabled=self.use_amp):
-            loss, d = self._diffusion_loss(source, target, mask, phase, level, t, noise)
+            loss, d, x0_hat_m = self._diffusion_loss(
+                source, target, mask, phase, level, t, noise)
+
+        adv_log = {'adv': 0.0, 'fm': 0.0, 'disc': 0.0}
+        if self.D is not None:
+            # ONE denoiser forward per step: `x0_hat_m` above already carries the
+            # generator's graph, and `.detach()` inside is what feeds D. The
+            # reference GAN trainer runs its generator a second time under
+            # no_grad for this; on a diffusion U-Net that would be close to a 2x
+            # slowdown for no benefit. See trainer_adv's docstring, point 1.
+            # Not wrapped in autocast here — `_adversarial_term` opens it around
+            # the forwards only, so D's backward stays outside one.
+            adv_term, adv_log = self._adversarial_term(
+                source, target, x0_hat_m, t, phase, level)
+            if adv_term is not None:
+                loss = loss + adv_term
+                d['total'] = float(loss.detach())
 
         self.scaler_G.scale(loss).backward()
         self.scaler_G.unscale_(self.opt_G)
@@ -296,6 +494,9 @@ class DiffusionTrainer(Trainer):
             'ssim':      0.0, 'grad': 0.0, 'freq': 0.0,
             'organ':     d['organ'],
             'hu_profile': d['hu_profile'],
+            'adv':       adv_log['adv'],
+            'fm':        adv_log['fm'],
+            'disc':      adv_log['disc'],
         }
 
     # -----------------------------------------------------------------------
@@ -361,8 +562,8 @@ class DiffusionTrainer(Trainer):
             if t.numel() != B:                     # last partial batch guard
                 continue
             with autocast('cuda', enabled=self.use_amp):
-                _, d = self._diffusion_loss(src, tgt, mask, self._phase(batch),
-                                            self._level(batch), t, noise)
+                _, d, _ = self._diffusion_loss(src, tgt, mask, self._phase(batch),
+                                               self._level(batch), t, noise)
             losses.append(d['mse'])
             organ_losses.append(d['organ'])
 

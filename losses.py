@@ -20,12 +20,31 @@ All losses accept inputs of shape (B, C, H, W) [2-D] or (B, C, D, H, W) [3-D].
 
 WHAT THIS FORK DELETED, AND WHY (see DIFFUSION_PLAN.md)
 ------------------------------------------------------
-`AdversarialLoss`, `FeatureMatchingLoss`, `PerceptualLoss`, `DinoPerceptualLoss`,
-`PhaseSaliencyLoss`, `DinoSaliencyLoss`, `CyclicConsistencyLoss` and
-`SegmentationConsistencyLoss` are gone. Diffusion does not use a discriminator,
-and the VGG/DINO backbones need a network download the training host cannot do.
-The originals are in `../synthetic_CECT/losses.py`, which is frozen and still
-reproduces every number in `analysis/BASELINE_REFERENCE.md`.
+`PerceptualLoss`, `DinoPerceptualLoss`, `PhaseSaliencyLoss`, `DinoSaliencyLoss`,
+`CyclicConsistencyLoss` and `SegmentationConsistencyLoss` are gone: the VGG/DINO
+backbones need a network download the training host cannot do, and the rest went
+with them. The originals are in `../synthetic_CECT/losses.py`, which is frozen
+and still reproduces every number in `analysis/BASELINE_REFERENCE.md`.
+
+WHAT CAME BACK
+--------------
+`AdversarialLoss` and `FeatureMatchingLoss`. The original fork note said
+"diffusion does not use a discriminator", which is true of DDPM as published and
+false of every diffusion model that has to produce sharp output in a handful of
+sampling steps. Here the critic is applied to the model's ONE-STEP x0 ESTIMATE
+(see `trainer_diffusion.DiffusionTrainer._train_step` and `models_disc.py`), so
+it attaches to the diffusion objective the same way the organ losses already do
+-- through `predict_x0` -- and needs no sampling loop in the training step.
+
+READ THIS BEFORE TURNING IT ON. x0_hat is the posterior MEAN E[x0|x_t], not a
+sample from p(x0|x_t). Pushing a conditional mean to be indistinguishable from a
+sample is, strictly, asking the model to be overconfident: it buys sharpness by
+spending calibration. That is a real cost in this thesis, which measures
+per-voxel CRPS/coverage and the sample-to-target variance ratio. The term is
+therefore (a) gated to low t, where the posterior is nearly a point mass and the
+mean/sample distinction almost vanishes, (b) small by default (lambda_adv=2
+against an MSE of order 0.01-1), and (c) something to report var-ratio and
+coverage for BEFORE and AFTER, not to adopt on a PSNR table.
 
 WHAT IS NEW HERE
 ----------------
@@ -37,13 +56,87 @@ diffusion trainer, applied to the predicted x0 (§5.4).
 """
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 0.  Adversarial loss
+# ---------------------------------------------------------------------------
+
+class AdversarialLoss(nn.Module):
+    """LSGAN / BCE / hinge PatchGAN adversarial loss (dimension-agnostic).
+
+    'lsgan' is the default and matches the GAN baseline in ../synthetic_CECT, so
+    the adversarial scenarios here are comparable to the recorded ones.
+
+    'hinge' is offered because it is the pairing that spectral normalisation was
+    introduced with (Miyato et al. 2018) and is markedly better behaved when D is
+    winning -- which it always is early in a diffusion run, where x0_hat at
+    moderate t is visibly not a CT. Under LSGAN a saturated D still returns a
+    large gradient that is pure noise to G; the hinge clamps it to zero.
+    """
+
+    def __init__(self, mode: str = 'lsgan'):
+        super().__init__()
+        assert mode in ('bce', 'lsgan', 'hinge')
+        self.mode = mode
+
+    def disc_loss(self, pred_real: torch.Tensor, pred_fake: torch.Tensor) -> torch.Tensor:
+        if self.mode == 'lsgan':
+            return 0.5 * (F.mse_loss(pred_real, torch.ones_like(pred_real)) +
+                          F.mse_loss(pred_fake, torch.zeros_like(pred_fake)))
+        if self.mode == 'hinge':
+            return 0.5 * (F.relu(1.0 - pred_real).mean() +
+                          F.relu(1.0 + pred_fake).mean())
+        # One-sided label smoothing on the real branch only (0.9), as in the
+        # baseline: smoothing the FAKE label too is the variant that is known to
+        # reinforce a wrong D rather than regularise it.
+        real = F.binary_cross_entropy_with_logits(pred_real, torch.full_like(pred_real, 0.9))
+        fake = F.binary_cross_entropy_with_logits(pred_fake, torch.zeros_like(pred_fake))
+        return 0.5 * (real + fake)
+
+    def gen_loss(self, pred_fake: torch.Tensor) -> torch.Tensor:
+        if self.mode == 'lsgan':
+            return F.mse_loss(pred_fake, torch.ones_like(pred_fake))
+        if self.mode == 'hinge':
+            return -pred_fake.mean()
+        return F.binary_cross_entropy_with_logits(pred_fake, torch.ones_like(pred_fake))
+
+
+# ---------------------------------------------------------------------------
+# 0b. Feature-matching loss (discriminator intermediate layers)
+# ---------------------------------------------------------------------------
+
+class FeatureMatchingLoss(nn.Module):
+    """L1 on discriminator intermediate features (pix2pixHD / Hau21).
+
+    The real features MUST come from the same D state as the fake ones. The
+    reference implementation reused the features produced inside the D step,
+    i.e. from D *before* its update, and compared them against fake features
+    from D *after* it -- and under disc_update_freq > 1 it silently contributed
+    exactly zero on the steps where D did not run, which scales the term's
+    effective weight by 1/disc_update_freq without saying so. The trainer here
+    recomputes both under the post-update D, in one place.
+    """
+
+    def forward(
+        self,
+        real_features: List[torch.Tensor],
+        fake_features: List[torch.Tensor],
+    ) -> torch.Tensor:
+        if not real_features:
+            # Device- and dtype-correct, unlike a bare torch.tensor(0.0), which
+            # raises the moment it is added to a CUDA total.
+            return fake_features[0].new_zeros(()) if fake_features else torch.zeros(())
+        loss = sum(F.l1_loss(fk, re.detach())
+                   for re, fk in zip(real_features, fake_features))
+        return loss / len(real_features)
 
 
 # ---------------------------------------------------------------------------
@@ -388,15 +481,24 @@ class CompositeLoss(nn.Module):
                                      and L1 is replaced by Gaussian NLL
 
     Key λ values (defaults): lambda_l1=100 (decayed by the curriculum when
-    use_l1_decay is on), lambda_organ=20, lambda_hu_profile=50.
+    use_l1_decay is on), lambda_organ=20, lambda_hu_profile=50, lambda_fm=10.
+    lambda_adv is NOT one of them — it is passed in per call as `adv_weight`,
+    because its warmup schedule is owned by the trainer (see __init__).
 
-    WHAT CHANGED IN THIS FORK. `use_adversarial`, `use_perceptual`,
-    `use_feature_matching`, `use_saliency`, `use_cycle` and `use_seg_consistency`
-    are gone along with their terms — see this module's docstring. lambda_l1 is
-    consequently no longer parametric on which of them is active: nothing left in
-    this file trades pixel fidelity for realism, so L1 always starts at
-    `lambda_l1` and `lambda_l1_reduced` is unused. The L1 DECAY CURRICULUM is
-    kept, because that is what gives a zero entry in ORGAN_WEIGHTS any force.
+      use_adversarial      False    PatchGAN adversarial term; needs
+                                     `adv_fake_logits` from the trainer
+      use_feature_matching False    L1 on D's intermediate features; needs
+                                     `real_features` / `fake_features`
+
+    WHAT CHANGED IN THIS FORK. `use_perceptual`, `use_saliency`, `use_cycle` and
+    `use_seg_consistency` are gone along with their terms — see this module's
+    docstring. lambda_l1 is NOT made parametric on which losses are active, even
+    now that the adversarial term is back: the reference implementation dropped
+    lambda_l1 100 -> 25 the moment any realism loss was switched on, which
+    silently confounded "added adversarial" with "quartered L1" in every
+    adversarial-vs-L1 comparison it produced. Use `use_l1_decay` if the L1 weight
+    should move; then it moves on an epoch schedule that is logged, auditable and
+    identical across scenarios.
     """
 
     def __init__(self, config: Dict):
@@ -436,6 +538,25 @@ class CompositeLoss(nn.Module):
                 log_var_min = c.get('log_var_min', -14.0),
                 log_var_max = c.get('log_var_max', 4.0),
             )
+
+        # Adversarial / feature matching — the GENERATOR half only. D's half of
+        # the objective lives in `trainer_adv.AdversarialMixin`, which builds its
+        # own `AdversarialLoss` from the same `adv_mode` key; the class is
+        # stateless, so the two halves cannot disagree.
+        #
+        # lambda_adv and its warmup are NOT owned here, unlike lambda_l1: the
+        # weight is passed in per call (`adv_weight`). The diffusion trainer does
+        # not use CompositeLoss at all, so a warmup counter here would be a
+        # SECOND schedule that only one of the two paths advances — and the one
+        # the trainer logs into history['lambda_adv'] would not be the one the
+        # loss applied. `AdversarialMixin._adv_w` is the single owner.
+        self.use_adv    = c.get('use_adversarial', False)
+        self.use_fm     = c.get('use_feature_matching', False)
+        self.lambda_fm  = c.get('lambda_fm', 10.0)
+        if self.use_adv or self.use_fm:
+            self.adv_loss = AdversarialLoss(mode=c.get('adv_mode', 'lsgan'))
+        if self.use_fm:
+            self.fm = FeatureMatchingLoss()
 
         self.use_ssim   = c.get('use_ssim', False)
         self.lambda_ssim= c.get('lambda_ssim', 10.0)
@@ -499,12 +620,20 @@ class CompositeLoss(nn.Module):
         target:           torch.Tensor,
         mask:             Optional[torch.Tensor] = None,
         log_var:          Optional[torch.Tensor] = None,
+        adv_fake_logits:  Optional[torch.Tensor] = None,
+        adv_weight:       Optional[float] = None,
+        real_features:    Optional[List[torch.Tensor]] = None,
+        fake_features:    Optional[List[torch.Tensor]] = None,
     ):
         """Returns (total_loss, loss_dict).
 
         `log_var` is required exactly when use_hetero is True; passing it to a
         non-heteroscedastic loss raises rather than being silently ignored, the
         same rule the generator applies to its conditioning inputs.
+
+        `adv_fake_logits` / `*_features` come from the trainer's discriminator
+        and are required exactly when the matching flag is on, for the same
+        reason.
         """
         d: Dict[str, float] = {}
         total = pred.new_zeros(1).squeeze()
@@ -533,6 +662,36 @@ class CompositeLoss(nn.Module):
             total = total + l1
             d['lambda_l1'] = _lam_l1    # logged so the curriculum is auditable
             d['nll'] = 0.0
+
+        if self.use_adv:
+            if adv_fake_logits is None:
+                raise ValueError("use_adversarial=True requires `adv_fake_logits` "
+                                 "— the discriminator's verdict on `pred`")
+            if adv_weight is None:
+                raise ValueError("use_adversarial=True requires `adv_weight` — "
+                                 "the warmed-up lambda_adv, owned by the trainer")
+            _lam_adv = float(adv_weight)
+            adv = self.adv_loss.gen_loss(adv_fake_logits) * _lam_adv
+            # RAW value, not the lambda-scaled contribution — same rule as L1
+            # above, so `train_adv` does not change units when the warmup ends.
+            d['adversarial'] = float(adv.detach()) / _lam_adv if _lam_adv else 0.0
+            d['lambda_adv'] = _lam_adv
+            total = total + adv
+        else:
+            if adv_fake_logits is not None:
+                raise ValueError("`adv_fake_logits` was given but use_adversarial "
+                                 "is False — it would be silently ignored.")
+            d['adversarial'] = 0.0
+            d['lambda_adv'] = 0.0
+
+        if self.use_fm:
+            if fake_features is None:
+                raise ValueError("use_feature_matching=True requires "
+                                 "`fake_features` from the discriminator")
+            fm = self.fm(real_features or [], fake_features) * self.lambda_fm
+            d['feature_matching'] = fm.item();  total = total + fm
+        else:
+            d['feature_matching'] = 0.0
 
         if self.use_ssim:
             ssim = self.ssim(pred, target) * self.lambda_ssim

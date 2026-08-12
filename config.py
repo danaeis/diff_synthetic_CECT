@@ -142,32 +142,9 @@ MIN_PATCH_MAX  = -500.0           # must have at least some tissue
 # phase-consistency losses so patches actually contain the aorta/portal vein/IVC
 # those losses depend on. ORGAN_FOCUS_LABELS restricts the focus to specific
 # TotalSegmentator label ids (needs MULTILABEL masks); None = any mask>0 voxel.
-# MEASURED, on the current 20k-patch cache: of 16 sampled training patches in
-# `patch_grids/train_patch_grid.png`, roughly four contain an abdominal organ.
-# The rest are shoulder, arm, chest wall, subcutaneous fat, spine and air —
-# tissue that does not enhance, where the correct output is a copy of the input.
-# The uniform grid passes 92.4% of candidates (188,168 of 203,584), so most
-# gradient steps are training the identity map. That is the leading explanation
-# for generated volumes that are closer to the NCCT than the NCCT is to the CECT.
 ORGAN_FOCUS_FRAC   = 0.0
 ORGAN_FOCUS_LABELS = None         # e.g. aorta/IVC/portal-vein ids for phase work
 MAX_FOCUS_CAND_PER_VOL = 3000
-
-# ── Augmentation ──────────────────────────────────────────────────────────────
-# 'none' | 'flip_ap' | 'flip' | 'flip_rot90'. Train split only; see
-# dataset.CTPairDataset._augment. Applied at __getitem__, so it does NOT enter
-# the patch-cache key and costs no re-cache.
-#
-# There was no augmentation of any kind before this: the cache is a fixed set of
-# patches and __getitem__ a list lookup, so 200 epochs saw 200 copies of the same
-# 20,000 images drawn from 97 cases, using 10.6% of the 188k available. The
-# measured cost is a ~2x train/val gap (`memorize97`: train MAE 0.0086, val
-# 0.0157; `capacity_overfit`: 0.0058 vs 0.0192) — these models overfit, they do
-# not underfit, so capacity and schedule length are not the lever.
-#
-# NO INTENSITY MODE EXISTS, deliberately. The prediction target is an absolute HU
-# level (aortic case-to-case sd 24.4 HU) and jitter destroys it. See _augment.
-AUGMENT = 'flip'
 
 # ── RAM preload budget ────────────────────────────────────────────────────────
 MAX_TRAIN_PATCHES = 20_000
@@ -189,11 +166,11 @@ DATA_SEED  = 42
 
 # ── Training schedule ────────────────────────────────────────────────────────
 BATCH_SIZE   = 16
-# Measured on the l1_only / bowel_zero / organ_curriculum runs: organ-region SSIM
+# Measured on the l1_only / bowel_zero / organ_curriculums runs: organ-region SSIM
 # plateaus by epoch ~13 and the remaining ~55 epochs change nothing (train L1 flat
 # at 0.0137 raw from epoch 13 to 69). 45 leaves margin for the decay curriculum to
 # finish at epoch 30 and anneal afterwards, without paying for dead epochs.
-EPOCHS       = 45
+EPOCHS       = 200
 LR_GEN       = 2e-4
 BETAS        = (0.5, 0.999)
 WEIGHT_DECAY = 1e-5
@@ -231,10 +208,18 @@ GEN_DROPOUT  = 0.20
 GEN_NORM     = 'instance'
 
 # ── Extra loss flags (ablation switches) ─────────────────────────────────────
-# The adversarial / perceptual / feature-matching / saliency / cycle /
-# seg-consistency flags were removed with their losses when this repo was forked
-# for the diffusion work — see losses.py's docstring. They live on in
-# ../synthetic_CECT.
+# The perceptual / saliency / cycle / seg-consistency flags were removed with
+# their losses when this repo was forked for the diffusion work — see losses.py's
+# docstring. They live on in ../synthetic_CECT.
+#
+# The ADVERSARIAL flags came back, and on the diffusion path they mean something
+# different from what they meant in the GAN baseline: the critic judges the
+# model's ONE-STEP x0 ESTIMATE at a random (low) timestep, not a sampled volume.
+# Read trainer_diffusion.py's module docstring §4 before switching this on — in
+# particular the part about what it costs in calibration, which is a headline
+# number in this thesis and is not visible in a PSNR/SSIM table.
+USE_ADVERSARIAL      = False
+USE_FEATURE_MATCHING = False
 USE_SSIM             = False
 USE_GRADIENT         = False
 USE_FREQUENCY        = False
@@ -248,12 +233,14 @@ USE_ORGAN            = False
 USE_HU_PROFILE       = False
 
 # ── Loss weights ─────────────────────────────────────────────────────────────
-# lambda_l1 is no longer parametric on other losses: the three terms it used to
-# back off for (adversarial, perceptual, feature matching) were removed in this
-# fork, and nothing left in losses.py trades pixel fidelity for realism. L1
-# therefore always starts at LAMBDA_L1 and LAMBDA_L1_REDUCED is unused.
-# The L1 DECAY CURRICULUM below is unaffected and still active — it is what gives
-# a zero entry in ORGAN_WEIGHTS any force.
+# lambda_l1 is NOT parametric on which other losses are active, and deliberately
+# stays that way now that the adversarial term is back. The reference GAN config
+# dropped LAMBDA_L1 100 → 25 the instant any realism loss was enabled, which made
+# every "L1 vs L1+adv" row in that codebase a comparison of TWO changes at once —
+# and is the most likely reason its own notes record that every
+# adversarial-inclusive scenario converged to near-identical metrics. If the L1
+# weight should move, move it with USE_L1_DECAY, on a logged epoch schedule that
+# is identical across scenarios.
 LAMBDA_L1            = 100.0
 # ── L1 decay curriculum ──────────────────────────────────────────────────────
 # Three-stage curriculum: structure (L1) → contrast (organ) → texture (adv).
@@ -292,6 +279,62 @@ LAMBDA_ORGAN         =  20.0
 # not enough to dominate the spatial terms it is meant to complement.
 LAMBDA_HU_PROFILE    =  50.0
 ORGAN_WEIGHT         =  10.0   # legacy uniform mode, used only when ORGAN_WEIGHTS is None
+
+# ── Adversarial branch ───────────────────────────────────────────────────────
+# 2.0 is the reference GAN baseline's value and is kept so the two are
+# comparable, but note what it means HERE: the diffusion MSE it is added to is
+# of order 1e-2..1, and the LSGAN generator loss is of order 1, so λ=2 makes the
+# adversarial term the DOMINANT gradient once the warmup finishes. That is a
+# strictly bigger intervention than the same number was in the GAN baseline,
+# where it competed with an L1 term at λ=100. Sweep DOWN from here (0.1, 0.5)
+# before sweeping up, and read `train_adv * lambda_adv` against `train_l1` in
+# history.json rather than trusting the number.
+LAMBDA_ADV        =   2.0
+# pix2pixHD's feature matching. Cheap, and the closest thing to a "free"
+# stabiliser: it is an L1 between D's intermediate activations, so it gives G a
+# dense target even on steps where the adversarial signal has saturated.
+LAMBDA_FM         =  10.0
+ADV_MODE          = 'lsgan'   # 'lsgan' | 'bce' | 'hinge'  (see losses.AdversarialLoss)
+# Linear warmup of λ_adv, in epochs. Longer than the baseline's 5 by default on
+# the diffusion path, where an early x0_hat is not a CT at all and D reaches ~0
+# loss within one epoch.
+ADV_WARMUP_EPOCHS =  10
+LR_DISC           = 1e-4
+DISC_UPDATE_FREQ  =    1      # D steps per G step
+DISC_NDF          =   64
+# 'group' (default), not the reference's 'batch'. D is called on the real batch
+# and the fake batch in separate forwards, so BatchNorm normalises each by its
+# own statistics and hands D a way to separate them that has nothing to do with
+# image content. See models_disc.py.
+DISC_NORM         = 'group'
+DISC_SPECTRAL     = True      # spectral norm on every D conv
+# Conditional discriminator: D sees cat([source, image]) — pix2pix's D(x, y),
+# which judges whether the PAIR is consistent rather than whether the image alone
+# looks real. On this task that is the version worth running: an unconditional
+# texture critic has no way to notice that the synthesised contrast belongs to a
+# different patient's anatomy.
+USE_COND_DISC     = False
+# Zero-centred gradient penalty on real samples, applied lazily every R1_EVERY
+# D steps and scaled by R1_EVERY so its time-average weight is LAMBDA_R1.
+# 0 = off. Reach for it (try 1.0) when train_disc collapses toward 0 in the first
+# few epochs, which is the expected failure on a few-hundred-volume dataset.
+LAMBDA_R1         =   0.0
+R1_EVERY          =    16
+
+# Diffusion-only. The adversarial term is applied only to items whose drawn
+# timestep is below ADV_MAX_T; None → half the schedule. Above that the one-step
+# x0 estimate is a genuine conditional MEAN rather than a near-sample, and
+# "make the mean look like a draw" is a request to be overconfident — which this
+# thesis measures directly (var_ratio, CRPS, coverage). See
+# trainer_diffusion.py §4b.
+ADV_MAX_T         = None
+# How the x0 estimate is bounded before D sees it: 'straight_through' clamps the
+# VALUE to [-1,1] while passing the gradient through unchanged. A plain 'hard'
+# clamp zeroes the gradient on exactly the saturated voxels that are out of range
+# — the mistake already made once with the organ losses (see AUX_MAX_T). 'none'
+# lets D separate real from fake on range alone. Both non-default values exist to
+# be ablated against.
+ADV_CLIP_MODE     = 'straight_through'
 
 # ── Per-organ loss weights ───────────────────────────────────────────────────
 # Rationale (measured on a sample _seg_full mask, cross-referenced against the
@@ -491,63 +534,14 @@ AUX_MAX_T        = 700
 # drawn, and selecting a checkpoint on it is selecting on noise.
 DIFFUSION_VAL_SEED    = 1234
 
-# Sampled val metrics cost a full DDIM pass, so they run every N epochs. They are
-# now also what `diffusion_selection='detail'` selects on, so lowering this buys
-# more checkpoint candidates at the cost of a DDIM pass per epoch.
+# Sampled val metrics cost a full DDIM pass, so they run every N epochs and are
+# for looking at, never for selection (see DiffusionTrainer._selection_score).
 DIFFUSION_SAMPLE_EVERY = 10
 DIFFUSION_SAMPLE_STEPS = 25
 
-# ── Diffusion: the level channel ──────────────────────────────────────────────
-# Scale of the per-item DC component added to the training noise, and of the
-# single per-VOLUME constant added to the inference noise field. 0 disables.
-#
-# The rationale in one line: the quantity this fork exists to sample is a flat
-# per-case HU offset with sd 24.4 HU, but the mean of a 128x128 unit-noise patch
-# has sd 1/128 = 2.3 HU on this window, and an unweighted MSE gives that
-# direction 1/16384 of the gradient. The prior is ~10x too narrow and the loss
-# barely sees it. See models_diffusion.offset_noise for the full argument.
-#
-# MUST match between training and sampling — it is read back out of
-# run_config.json by infer_volume.DiffusionPredictor, never from a CLI default.
-DIFFUSION_OFFSET_NOISE = 0.1
-
-# min-SNR-gamma loss weighting (Hang et al. 2023). 0 disables; 5.0 is the paper's
-# value. Rebalances the objective away from the low-t steps that dominate an
-# unweighted MSE and toward the high-t steps that decide the level.
-# See NoiseSchedule.min_snr_weight.
-MIN_SNR_GAMMA = 5.0
-
-# EMA decay for the diffusion weights. 0 disables. Near-universal in the DDPM
-# lineage and absent from this repo until now. The averaged weights are what
-# every val pass, every sample grid and `infer_volume` see; the live weights are
-# kept in the checkpoint's `G_raw_state` so a resume is exact.
-EMA_DECAY = 0.999
-
-# Adam betas on the DIFFUSION path only. The project-wide BETAS = (0.5, 0.999) is
-# inherited from the GAN baseline, where a short momentum window keeps the
-# generator responsive to a moving discriminator. There is no discriminator here
-# and the objective is stationary, so the longer DDPM/ADM standard window is what
-# averages away the per-step timestep noise.
-DIFFUSION_BETAS = (0.9, 0.999)
-
-# How `best_model.pth` is chosen on the diffusion path.
-#   'detail'   |raps_hf - 1| + organ gradW1, from the DDIM sample. The default.
-#   'val_loss' the denoising MSE. Legacy, and structurally wrong: every
-#              per-voxel loss is minimised by the conditional mean, so it picks
-#              the epoch whose samples are blurriest — the exact failure this
-#              fork exists to fix. Kept only to reproduce the earlier runs.
-# `SELECTION_METRIC` above is not consulted on this path; it names metrics that
-# need a deterministic forward pass.
-DIFFUSION_SELECTION = 'detail'
-
 # ── Misc ─────────────────────────────────────────────────────────────────────
 USE_AMP              = True
-# Rolling checkpoints kept besides `best_model.pth`. Raised from 3 because
-# `best_model.pth` is chosen on ONE metric, and when that metric turns out to
-# have been the wrong one (val_loss selecting the blurriest epoch, see
-# DIFFUSION_SELECTION) the alternative epochs have already been deleted and the
-# run has to be repeated from scratch to recover them.
-KEEP_N_CHECKPOINTS   = 10
+KEEP_N_CHECKPOINTS   = 3
 SAVE_SAMPLES_EVERY   = 1
 KEEP_N_SAMPLE_EPOCHS = 5
 
@@ -610,7 +604,6 @@ train_config: dict = dict(
     min_patch_mean       = MIN_PATCH_MEAN,
     min_patch_max        = MIN_PATCH_MAX,
     # organ-focused sampling
-    augment                    = AUGMENT,
     organ_focus_frac           = ORGAN_FOCUS_FRAC,
     organ_focus_labels         = ORGAN_FOCUS_LABELS,
     max_focus_candidates_per_vol = MAX_FOCUS_CAND_PER_VOL,
@@ -639,6 +632,8 @@ train_config: dict = dict(
     generator_norm          = GEN_NORM,
     # baseline loss flags
     # extra loss flags
+    use_adversarial      = USE_ADVERSARIAL,
+    use_feature_matching = USE_FEATURE_MATCHING,
     use_ssim             = USE_SSIM,
     use_gradient         = USE_GRADIENT,
     use_frequency        = USE_FREQUENCY,
@@ -660,6 +655,21 @@ train_config: dict = dict(
     organ_weight_preset      = ORGAN_WEIGHT_PRESET,
     organ_weight_default     = ORGAN_WEIGHT_DEFAULT,
     organ_weight_background  = ORGAN_WEIGHT_BACKGROUND,
+    # adversarial branch
+    lambda_adv           = LAMBDA_ADV,
+    lambda_fm            = LAMBDA_FM,
+    adv_mode             = ADV_MODE,
+    adv_warmup_epochs    = ADV_WARMUP_EPOCHS,
+    adv_max_t            = ADV_MAX_T,
+    adv_clip_mode        = ADV_CLIP_MODE,
+    lr_disc              = LR_DISC,
+    disc_update_freq     = DISC_UPDATE_FREQ,
+    disc_ndf             = DISC_NDF,
+    disc_norm            = DISC_NORM,
+    disc_spectral        = DISC_SPECTRAL,
+    use_cond_disc        = USE_COND_DISC,
+    lambda_r1            = LAMBDA_R1,
+    r1_every             = R1_EVERY,
     # heteroscedastic baseline
     use_hetero           = USE_HETERO,
     lambda_nll           = LAMBDA_NLL,
@@ -674,11 +684,6 @@ train_config: dict = dict(
     diffusion_val_seed   = DIFFUSION_VAL_SEED,
     diffusion_sample_every = DIFFUSION_SAMPLE_EVERY,
     diffusion_sample_steps = DIFFUSION_SAMPLE_STEPS,
-    diffusion_selection    = DIFFUSION_SELECTION,
-    diffusion_offset_noise = DIFFUSION_OFFSET_NOISE,
-    min_snr_gamma          = MIN_SNR_GAMMA,
-    ema_decay              = EMA_DECAY,
-    diffusion_betas        = DIFFUSION_BETAS,
     # misc
     use_mixed_precision     = USE_AMP,
     keep_last_n_checkpoints = KEEP_N_CHECKPOINTS,

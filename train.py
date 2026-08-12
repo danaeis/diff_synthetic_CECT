@@ -217,6 +217,47 @@ def _parse():
                    help='val patches in the per-epoch sample grid (default random)')
     p.add_argument('--sample_n',    type=int, default=None,
                    help='rows in the sample grid (default 4)')
+    # ── adversarial branch ──────────────────────────────────────────────────
+    p.add_argument('--lambda_adv', type=float, default=None,
+                   help='Generator-side GAN weight after warmup. NOTE the scale: '
+                        'the diffusion MSE it is added to is O(1e-2..1), so the '
+                        'baseline default of 2.0 makes this the dominant term. '
+                        'Sweep downward first.')
+    p.add_argument('--lambda_fm', type=float, default=None,
+                   help='pix2pixHD feature-matching weight (needs --use_feature_matching).')
+    p.add_argument('--adv_mode', type=str, default=None,
+                   choices=['lsgan', 'bce', 'hinge'],
+                   help="'hinge' pairs with spectral norm and degrades more "
+                        'gracefully when D is winning, which it always is early '
+                        'on the diffusion path.')
+    p.add_argument('--adv_warmup_epochs', type=int, default=None,
+                   help='Linear warmup of lambda_adv, in epochs.')
+    p.add_argument('--adv_max_t', type=int, default=None,
+                   help='Diffusion only: apply the adversarial term only where '
+                        't < this. Default half the schedule. Above it the '
+                        'one-step x0 estimate is a conditional MEAN, and '
+                        'sharpening a mean costs calibration — see '
+                        'trainer_diffusion.py section 4b.')
+    p.add_argument('--adv_clip_mode', type=str, default=None,
+                   choices=['straight_through', 'hard', 'none'],
+                   help='How x0_hat is bounded before D sees it. The two '
+                        'non-default values exist to be ablated against.')
+    p.add_argument('--lr_disc', type=float, default=None)
+    p.add_argument('--disc_update_freq', type=int, default=None,
+                   help='D steps per G step.')
+    p.add_argument('--disc_ndf', type=int, default=None)
+    p.add_argument('--disc_norm', type=str, default=None,
+                   choices=['group', 'batch', 'instance', 'none'],
+                   help="'batch' reproduces the reference D, including its "
+                        'real-vs-fake batch-statistics leak. See models_disc.py.')
+    p.add_argument('--no_disc_spectral', dest='disc_spectral',
+                   action='store_false', default=None,
+                   help='Drop spectral norm from D.')
+    p.add_argument('--lambda_r1', type=float, default=None,
+                   help='Lazy R1 gradient penalty on real samples. 0 = off. Try '
+                        '1.0 when train_disc collapses toward 0 early.')
+    p.add_argument('--r1_every', type=int, default=None)
+
     p.add_argument('--lambda_organ',       type=float, default=None)
     p.add_argument('--lambda_hu_profile',  type=float, default=None)
     p.add_argument('--lambda_l1_floor',    type=float, default=None)
@@ -226,7 +267,8 @@ def _parse():
     # Loss flags: --use_X / --no_X
     for flag in ['ssim', 'gradient', 'frequency', 'organ',
                  'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond',
-                 'hetero', 'diffusion']:
+                 'hetero', 'diffusion', 'adversarial', 'feature_matching',
+                 'cond_disc']:
         g = p.add_mutually_exclusive_group()
         g.add_argument(f'--use_{flag}',  dest=f'use_{flag}', action='store_true', default=None)
         g.add_argument(f'--no_{flag}',   dest=f'use_{flag}', action='store_false')
@@ -268,7 +310,10 @@ def _apply(cfg: dict, args) -> dict:
               'parameterisation', 'diffusion_steps', 'cfg_drop_prob',
               'aux_max_t', 'diffusion_sample_every', 'diffusion_selection',
               'diffusion_offset_noise', 'min_snr_gamma', 'ema_decay',
-              'lambda_nll']:
+              'lambda_nll',
+              'lambda_adv', 'lambda_fm', 'adv_mode', 'adv_warmup_epochs',
+              'adv_max_t', 'adv_clip_mode', 'lr_disc', 'disc_update_freq',
+              'disc_ndf', 'disc_norm', 'disc_spectral', 'lambda_r1', 'r1_every']:
         v = getattr(args, k, None)
         if v is not None:
             c[k] = v
@@ -276,7 +321,8 @@ def _apply(cfg: dict, args) -> dict:
         c['diffusion_betas'] = (args.diffusion_beta1, c['diffusion_betas'][1])
     for flag in ['ssim', 'gradient', 'frequency', 'organ',
                  'l1_decay', 'per_organ_weights', 'hu_profile', 'phase_cond',
-                 'hetero', 'diffusion']:
+                 'hetero', 'diffusion', 'adversarial', 'feature_matching',
+                 'cond_disc']:
         v = getattr(args, f'use_{flag}', None)
         if v is not None:
             c[f'use_{flag}'] = v

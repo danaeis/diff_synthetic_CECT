@@ -247,36 +247,14 @@ PAIRED_METRICS = [
 ]
 
 
-def select_baseline(all_rows: Dict[str, List[Dict]], requested: Optional[str]) -> str:
-    """The model every paired test is measured against.
-
-    Raises SystemExit rather than returning something unusable, in both failure
-    modes. On an EMPTY table the old expression `next((n for n in all_rows if
-    'only' in n), next(iter(all_rows)))` raised a bare StopIteration — Python
-    evaluates the `next()` default eagerly, so the inner call fires first — with
-    no hint that the real cause was every case failing to load.
-
-    A `--baseline` naming the run DIRECTORY is accepted too: discover() strips the
-    `literature_baseline_` prefix from its keys, so the spelling a user reads off
-    `ls` would otherwise silently never match.
-    """
-    if not all_rows:
-        raise SystemExit('no model produced a scored case — nothing to use as a '
-                         'baseline')
-    if requested is None:
-        # An `*_only` run is the natural reference: it is the ablation floor.
-        return next((n for n in all_rows if 'only' in n), next(iter(all_rows)))
-    for cand in (requested, requested.replace('literature_baseline_', '')):
-        if cand in all_rows:
-            return cand
-    raise SystemExit(f'--baseline {requested!r} is not one of the scored models: '
-                     + ', '.join(all_rows))
-
-
 def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
     out.append(f'\n## Paired per-case tests vs "{base}"  (negative = better)')
     br = {r['_key']: r for r in all_rows[base]}
-    out.append(f"\n{'model':26s}{'metric':16s}{'delta':>10}{'t':>8}{'sig':>5}{'better':>9}")
+    # A fixed 26-char model column silently ran into the metric column for the
+    # `<run>/<phase>` names ('multiphase_film_adv_slices11/venous' is 35), which
+    # printed as 'multiphase_film_adv/venousfeature_l1_hu'. Size it to the data.
+    mw = max(26, max(len(n) for n in all_rows) + 2)
+    out.append(f"\n{'model':{mw}s}{'metric':16s}{'delta':>10}{'t':>8}{'sig':>5}{'better':>9}")
     for name, rows in all_rows.items():
         if name == base:
             continue
@@ -288,7 +266,7 @@ def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
             # paired_t([]) returns (0.0, 0.0, 0), so without this the block would
             # print a full set of '+0.000 ns' rows that read as "identical to the
             # baseline" when nothing was actually compared.
-            out.append(f'{name:26s}— no cases in common with the baseline; '
+            out.append(f'{name:{mw}s}— no cases in common with the baseline; '
                        f'not comparable')
             out.append('')
             continue
@@ -303,7 +281,7 @@ def paired_block(all_rows: Dict[str, List[Dict]], base: str, out: List[str]):
                     a, b = tf(a), tf(b)
                 d.append((b - a) if better_is_low else (a - b))   # sign: neg = better
             m, t, w = paired_t(d)
-            out.append(f"{(name if first else ''):26s}{label:16s}"
+            out.append(f"{(name if first else ''):{mw}s}{label:16s}"
                        f"{m:+10.3f}  {t:+8.2f}  {sig(t):>4}{w:>5}/{len(d)}")
             first = False
         out.append('')
@@ -354,7 +332,7 @@ def master_table(summaries: List[Dict], out: List[str]):
     out.append('\n**Caveat:** external models retrained on this data at this scale do not '
                'reproduce their papers\' reported numbers — this is a controlled same-data, '
                'same-split comparison, not a reproduction. PSNR/SSIM reward blur here (see '
-               '../synthetic_CECT/PROJECT_PLAN.md); read organ-region + phase fidelity as primary.')
+               'PROJECT_PLAN.md); read organ-region + phase fidelity as primary.')
 
 
 # ---------------------------------------------------------------------------
@@ -365,15 +343,6 @@ def discover(runs_dir: Path) -> Dict[str, Path]:
     A run with a checkpoint but no manifest is reported rather than silently
     dropped: that is a missing inference step, not an absent model, and it is
     invisible in the output table otherwise.
-
-    Only `phase_infer/` is scanned, never infer_volume.py's other `--out_dir`
-    spellings. `literature_baseline_l1_adv` for instance also has a
-    `phase_infer_hann/`, and a guidance sweep writes `phase_infer_g1.5/` and
-    friends. Those are the SAME checkpoint under different inference settings, so
-    auto-discovering them would silently put several rows for one model in a table
-    whose rows are supposed to be models — and the paired block would compare a
-    model against itself. Score them deliberately, with
-    `--manifest name=<run>/phase_infer_hann/manifest.csv`.
     """
     found, pending = {}, []
     for d in sorted(runs_dir.iterdir()):
@@ -408,6 +377,27 @@ def discover(runs_dir: Path) -> Dict[str, Path]:
     return found
 
 
+def resolve_baseline(names, requested: str | None):
+    """Map a `--baseline` spelling onto a model name, or None if it matches none.
+
+    discover() strips the `literature_baseline_` prefix, so a baseline given as a
+    run DIRECTORY name would silently never match. Accept either spelling. With
+    no request, fall back to the L1-only reference arm.
+    """
+    names = list(names)
+    if not requested:
+        # 'l1_only' is the reference arm. Matching any *only* name sorted first
+        # picked `l1_huprofile_only` — an ablation, and the weakest level model in
+        # the table — as the silent default for a whole paired report.
+        return next((n for n in names if n in ('l1_only', 'literature_baseline_l1_only')),
+                    next((n for n in names if 'only' in n), next(iter(names), None)))
+    for cand in (requested, requested.replace('literature_baseline_', ''),
+                 f'literature_baseline_{requested}'):
+        if cand in names:
+            return cand
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -436,6 +426,15 @@ def main():
         manifests[name] = Path(path)
     if not manifests:
         raise SystemExit('no manifests — pass --runs_dir or --manifest name=path.csv')
+
+    # Check the baseline name BEFORE scoring: it costs seconds to catch a typo
+    # here and ~an hour of volume scoring to catch it after the loop, where the
+    # results were then discarded unwritten.
+    if args.baseline and resolve_baseline(manifests, args.baseline) is None:
+        raise SystemExit(f'--baseline {args.baseline!r} is not one of the models to be '
+                         f'scored: ' + ', '.join(manifests) +
+                         '\n(pass its manifest too: --manifest '
+                         f'{args.baseline}=<path>/manifest.csv, or --runs_dir)')
 
     organ_map = None
     if args.organ_map and args.organ_map.exists():
@@ -467,22 +466,20 @@ def main():
               f'featHU {s["feature_l1_hu"]:.2f}')
 
     if not all_rows:
-        # Every model was skipped. Without this the next few lines fail on an empty
-        # container in three different ways — `next(iter({}))` (evaluated EAGERLY as
-        # the default arg below, so it raises before the outer next() runs),
-        # summaries[0], flat[0] — and the user gets a bare StopIteration with no
-        # message. The overwhelmingly common cause is manifest paths: they are
-        # stored as written at generation time and are relative to the repo root.
-        raise SystemExit(
-            'no model produced a scored case. The manifests were found, but every '
-            'case failed to load — check that their gen_path/real_path/mask_path '
-            'resolve from the current working directory (they are stored relative '
-            'to the repo root, so run benchmark.py from there).')
+        raise SystemExit('no model produced scored cases — nothing to report')
 
     lines: List[str] = []
     master_table(summaries, lines)
-    base = select_baseline(all_rows, args.baseline)
-    if len(all_rows) > 1:
+    # A missing paired block is a note in the report, never a hard exit: the
+    # per-model scoring is the expensive part and stays worth writing out.
+    base = resolve_baseline(all_rows, args.baseline)
+    if len(all_rows) < 2:
+        lines.append(f'\n_Only one model scored ({next(iter(all_rows))}) — paired tests '
+                     'need at least two, so none were run._')
+    elif base is None:
+        lines.append(f'\n_Baseline {args.baseline!r} scored no cases — paired tests '
+                     'skipped._')
+    else:
         paired_block(all_rows, base, lines)
     report = '\n'.join(lines)
     print('\n' + report)

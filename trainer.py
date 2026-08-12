@@ -14,10 +14,11 @@ Batch format (from CTPairDataset):
 The trainer is completely independent of the dimensionality of the patches —
 it delegates all shape-awareness to the models and losses.
 
-FORK NOTE: the PatchGAN discriminator branch (`_disc_step`, `_d_in`,
-`_cond_for_d`, opt_D, scaler_D) was removed along with the adversarial losses.
-It is still in `../synthetic_CECT/trainer.py` if an adversarial run is ever needed
-again.
+ADVERSARIAL BRANCH: the discriminator half of the step lives in
+`trainer_adv.AdversarialMixin`, which this class mixes in and every subclass
+therefore inherits — including `DiffusionTrainer`, which is the reason it is a
+mixin rather than inline code here. Read that module's docstring for what it
+changes relative to the `../synthetic_CECT/trainer.py` original.
 """
 
 import gc
@@ -43,6 +44,7 @@ from losses import CompositeLoss
 from metrics import grad_hist_distance, raps_hf_ratio
 from models import UNetGenerator
 from models_hetero import HeteroGenerator
+from trainer_adv import AdversarialMixin
 
 log = logging.getLogger(__name__)
 
@@ -279,7 +281,7 @@ class EarlyStopping:
 # Trainer
 # ---------------------------------------------------------------------------
 
-class Trainer:
+class Trainer(AdversarialMixin):
     """
     Training loop for the literature baseline.
 
@@ -348,6 +350,22 @@ class Trainer:
         self.use_amp  = config.get('use_mixed_precision', True) and self.device == 'cuda'
         self.scaler_G = GradScaler('cuda', enabled=self.use_amp)
 
+        # ── discriminator (optional) ────────────────────────────────────────
+        # Built last, and strictly inside its own flag, so a non-adversarial run
+        # draws the RNG sequence it drew before this branch existed. No timestep
+        # conditioning here: this generator has no timestep. Its phase/level
+        # vector is `phase_cond_dim` wide, and is only fed to D when the D is
+        # conditional at all — an unconditional texture critic that also got the
+        # requested phase would be judging a pairing it cannot see.
+        self._init_adversarial(
+            config, dims=dims,
+            source_channels=config.get('in_channels', 1),
+            cond_dim=(config.get('phase_cond_dim', 64)
+                      if (config.get('use_cond_disc', False)
+                          and getattr(self.G, 'use_cond', False)) else 0),
+            use_t_cond=False,
+        )
+
         # ── state ───────────────────────────────────────────────────────────
         self.global_step   = 0
         self.current_epoch = 0
@@ -359,6 +377,12 @@ class Trainer:
             'epoch', 'lr_gen', 'lambda_l1',   # lambda_l1 varies under the decay curriculum
             'train_gen_total', 'train_l1', 'train_nll',
             'train_ssim', 'train_grad', 'train_freq', 'train_organ', 'train_hu_profile',
+            # Adversarial branch. train_adv is the RAW generator-side GAN loss
+            # (not lambda-scaled — see CompositeLoss) and train_disc is D's own
+            # loss. Read them TOGETHER: train_adv falling while train_disc also
+            # falls means D is winning and G is not, which is the collapse case;
+            # both hovering is the healthy one. Constant 0 when the flag is off.
+            'train_adv', 'train_fm', 'train_disc', 'lambda_adv',
             'val_loss',
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',              # global
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',  # organ-region
@@ -379,6 +403,7 @@ class Trainer:
             # input, i.e. conditioning bought nothing.
             f'gamma_{s}' for s in ('bottleneck', 'dec4', 'dec3', 'dec2', 'dec1')
         ] if config.get('use_phase_cond', False) else [])}
+        self._hist_keys = list(self.history)
 
         # Per-organ metrics: id→name map (from the CTPhase-XGBoost dump so organ
         # names match that phase model). Missing/unset → per-organ reported by
@@ -406,7 +431,8 @@ class Trainer:
 
     # -----------------------------------------------------------------------
     def _log_active_losses(self):
-        flags = ['ssim', 'gradient', 'frequency', 'organ', 'hu_profile']
+        flags = ['ssim', 'gradient', 'frequency', 'organ', 'hu_profile',
+                 'adversarial', 'feature_matching']
         base = ['GaussianNLL'] if self.use_hetero else ['L1']
         active = base + [f for f in flags if self.cfg.get(f'use_{f}')]
         log.info(f"Active losses: {' + '.join(active)}")
@@ -450,21 +476,54 @@ class Trainer:
             return out[:, :1], out[:, 1:2]
         return out, None
 
+    def _cond_for_d(self, phase, level):
+        """Conditioning vector for the DISCRIMINATOR — always DETACHED.
+
+        It is produced by the generator's embedding, so it must be cut from that
+        graph: D is a critic, and letting its gradients reach G's conditioning
+        embedding would let G lower the adversarial loss by reshaping what it
+        *claims* was requested instead of by improving the image.
+        """
+        if not getattr(self.D, 'cond_dim', 0):
+            return None
+        return self.G.cond_vec(phase, level).detach()
+
     def _train_step(self, batch: Dict) -> Dict:
         source = batch['source'].to(self.device)
         target = batch['target'].to(self.device)
         mask   = batch['mask'].to(self.device) if 'mask' in batch else None
         phase  = self._phase(batch)
         level  = self._level(batch)
+        dcond  = self._cond_for_d(phase, level) if self.D is not None else None
 
+        # ONE generator forward. `fake.detach()` feeds D; the same graph is then
+        # reused for the G step. See trainer_adv's docstring, point 1, for why
+        # the reference implementation's second forward is not needed.
         self.opt_G.zero_grad()
         with autocast('cuda', enabled=self.use_amp):
             fake, log_var = self._split_out(self.G(source, phase, level))
+
+        loss_D_val = 0.0
+        if self.D is not None and (self.global_step % self.disc_freq == 0):
+            loss_D_val = self._disc_step(target, fake.detach(),
+                                         source=source, cond=dcond)
+
+        with autocast('cuda', enabled=self.use_amp):
+            adv_logits = real_feats = fake_feats = None
+            if self.D is not None:
+                with self._frozen_d():
+                    adv_logits, real_feats, fake_feats = self._disc_verdict(
+                        fake, real=target, source=source, cond=dcond)
+
             loss_G, ld = self.criterion(
                 pred    = fake,
                 target  = target,
                 mask    = mask,
                 log_var = log_var,
+                adv_fake_logits = adv_logits if self.use_adv else None,
+                adv_weight      = self._adv_w() if self.use_adv else None,
+                real_features   = real_feats,
+                fake_features   = fake_feats,
             )
 
         self.scaler_G.scale(loss_G).backward()
@@ -483,6 +542,9 @@ class Trainer:
             'freq':      ld.get('frequency', 0),
             'organ':     ld.get('organ', 0),
             'hu_profile': ld.get('hu_profile', 0),
+            'adv':       ld.get('adversarial', 0),
+            'fm':        ld.get('feature_matching', 0),
+            'disc':      loss_D_val,
         }
 
     # -----------------------------------------------------------------------
@@ -716,6 +778,11 @@ class Trainer:
             state['sched_G'] = self.sched_G.state_dict()
         if self.use_amp:
             state['scaler_G'] = self.scaler_G.state_dict()
+        # D, its optimiser and its scaler, when there is one. Resuming an
+        # adversarial run without them would restart the critic from scratch
+        # against a fully-trained generator — a step change in the objective
+        # that is indistinguishable, in the curves, from a training collapse.
+        self._adv_checkpoint_state(state)
         # Write to a temp file and rename into place. torch.save straight to the
         # final path leaves a truncated, unloadable .pth if the process dies
         # mid-write (second Ctrl-C during the emergency save, OOM-kill, full
@@ -763,6 +830,7 @@ class Trainer:
                          "loaded weights")
                 ema.__init__(self.G, ema.decay)
         self.opt_G.load_state_dict(state['opt_G'])
+        self._adv_load_state(state)
         if 'sched_G' in state and self.sched_G is not None:
             self.sched_G.load_state_dict(state['sched_G'])
         if self.use_amp:
@@ -780,6 +848,14 @@ class Trainer:
                 self.history = {k: list(v[:keep]) for k, v in hist.items()}
             else:
                 self.history = hist
+            # Backfill channels this build records but the checkpoint predates
+            # (the adversarial ones, most recently). Without it `_update_history`
+            # raises KeyError on the first post-resume epoch, i.e. adding ANY new
+            # history channel silently breaks every existing checkpoint.
+            n = len(self.history.get('epoch', []))
+            for k in self._history_keys():
+                if k not in self.history:
+                    self.history[k] = [0.0] * n
         if state.get('per_organ_history'):
             ep = state.get('epoch', 0)
             self.per_organ_history = [r for r in state['per_organ_history']
@@ -837,8 +913,10 @@ class Trainer:
         h['epoch'].append(epoch)
         h['lr_gen'].append(self.opt_G.param_groups[0]['lr'])
         h['lambda_l1'].append(self.criterion._l1_w())
+        h['lambda_adv'].append(self._adv_w())
         for k in ['gen_total', 'l1', 'nll',
-                  'ssim', 'grad', 'freq', 'organ', 'hu_profile']:
+                  'ssim', 'grad', 'freq', 'organ', 'hu_profile',
+                  'adv', 'fm', 'disc']:
             h[f'train_{k}'].append(avgs.get(k, 0.0))
         for k in ['val_loss',
                   'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
@@ -851,6 +929,14 @@ class Trainer:
         for k, v in self.G.film_stats().items():
             if k in h:
                 h[k].append(v)
+
+    def _history_keys(self) -> List[str]:
+        """Channel names this build records, captured at construction.
+
+        Needed because `load_checkpoint` replaces `self.history` wholesale with
+        whatever dict the checkpoint holds, which may predate a channel.
+        """
+        return list(getattr(self, '_hist_keys', ()) or self.history)
 
     def _save_history(self):
         hist = {k: [float(v) for v in vl] for k, vl in self.history.items()}
@@ -943,11 +1029,20 @@ class Trainer:
         ax.set_title('Fidelity term (raw, unweighted)'); _legend(ax); ax.grid(alpha=0.3)
 
         ax = axes[0, 2]
+        # Adv and Disc are drawn on this panel deliberately, and dashed: they are
+        # the only pair here that has to be read TOGETHER. G's adversarial loss
+        # falling on its own means nothing; falling while D's loss also falls
+        # means D is winning and the term is injecting noise, which is the
+        # failure this panel exists to make visible within one epoch of it
+        # starting. Multiply Adv by history['lambda_adv'] for its contribution.
         for k, lbl in [('train_ssim','SSIM'), ('train_grad','Grad'),
                         ('train_freq','Freq'), ('train_organ','Organ'),
-                        ('train_hu_profile','HUprof')]:
-            if any(v > 0 for v in self.history[k]):
+                        ('train_hu_profile','HUprof'), ('train_fm','FM')]:
+            if any(v > 0 for v in (self.history.get(k) or [])):
                 ax.plot(ep, self.history[k], label=lbl)
+        for k, lbl in [('train_adv','Adv (G)'), ('train_disc','Disc (D)')]:
+            if any(v > 0 for v in (self.history.get(k) or [])):
+                ax.plot(ep, self.history[k], ls='--', label=lbl)
         ax.set_title('Extra losses'); _legend(ax); ax.grid(alpha=0.3)
 
         axes[0, 3].plot(ep, self.history['lr_gen']); axes[0, 3].set_title('LR (gen)')
@@ -1011,7 +1106,8 @@ class Trainer:
 
             accum: Dict[str, List] = {k: [] for k in [
                 'gen_total', 'l1', 'nll',
-                'ssim', 'grad', 'freq', 'organ', 'hu_profile'
+                'ssim', 'grad', 'freq', 'organ', 'hu_profile',
+                'adv', 'fm', 'disc',
             ]}
 
             pbar = tqdm(train_loader, desc=f'Ep {epoch}/{epochs}', leave=False)
@@ -1035,6 +1131,9 @@ class Trainer:
                 f"Ep {epoch:3d}/{epochs} | "
                 f"total={avgs['gen_total']:.4f}  l1={avgs['l1']:.4f}  "
                 f"nll={avgs['nll']:.4f}  organ={avgs['organ']:.4f} | "
+                + (f"adv={avgs['adv']:.4f}  disc={avgs['disc']:.4f}  "
+                   f"(lam={self._adv_w():.2f}) | " if self.D is not None else "")
+                +
                 f"MAE={val['val_mae']:.4f}  PSNR={val['val_psnr']:.2f}  "
                 f"SSIM={val['val_ssim']:.4f}  NCC={val['val_ncc']:.4f}"
             )

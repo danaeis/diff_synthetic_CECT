@@ -15,9 +15,7 @@
 #
 # ORDER MATTERS. Run the gates before the model they gate:
 #   0. python infer_volume.py --scenario_dir <any run> --dry_run
-#        -> tile count per volume + total forward passes. The whole sampling
-#           budget depends on it. Needs run_config.json and the data only, NOT a
-#           checkpoint, so it can be run before/while a scenario trains.
+#        -> tile count per volume. The whole sampling budget depends on it.
 #   1. python scripts/vae_fidelity.py ...      Gate D1 (§4)
 #   2. hetero_nll                              the bar (§6 step 2)
 #   3. diff_v                                  the model (§6 steps 4-5)
@@ -43,7 +41,8 @@ SCENARIOS=(
   # of analysis/BASELINE_REFERENCE.md. Should reproduce featHU ~13.46 at 3 seeds;
   # if it does not, nothing below is comparable to the recorded baseline and that
   # is the first thing to fix.
-  "l1_organ_groupnorm|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group"
+  "diff_l1_organ_groupnorm|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group"
+  "diff_l1_organ_groupnorm_adv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group  --use_adversarial --use_cond_disc --adv_warmup_epochs 15"
 
   # ── Step 2: the calibration baseline diffusion has to beat ─────────────────
   # Same config, plus a (mu, log sigma^2) head and Gaussian NLL instead of L1.
@@ -53,7 +52,7 @@ SCENARIOS=(
   #
   #   python infer_volume.py --scenario_dir <run> --split test
   #   python scripts/calibration_eval.py --mode gaussian --dir <run>/phase_infer
-  "hetero_nll|--use_hetero --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group"
+  "diff_hetero_nll|--use_hetero --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group"
 
   # ── Steps 4-5: conditional diffusion ───────────────────────────────────────
   # group norm throughout, so the comparison against l1_organ_groupnorm changes
@@ -72,40 +71,12 @@ SCENARIOS=(
   # are pulling the sampler back toward the conditional mean — which is worth
   # knowing and is exactly what the var-ratio column will show.
   "diff_v_organ|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile"
+  "diff_v_organ_adv|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15"
 
   # No classifier-free guidance. Isolates what the guidance dial costs at
   # training time; a guidance SWEEP is an inference-time flag
   # (infer_volume.py --guidance), not a scenario.
   "diff_v_nocfg|--use_diffusion --parameterisation v --generator_norm group --cfg_drop_prob 0.0"
-
-  # ── The level channel (IMPLEMENTATION.md §2a) ──────────────────────────────
-  # BEFORE running any of these, run Gate 0: infer_volume + benchmark.py on the
-  # EXISTING diff_* checkpoints. Without raps_hf / grad_w1 / var-ratio for the
-  # old runs there is nothing to compare against, and the pixel columns cannot
-  # tell "learned texture" from "copied the input" — the samples of diff_v,
-  # diff_x0 and diff_v_nocfg are all closer to the NCCT than the NCCT is to the
-  # CECT, which is the reading these scenarios exist to change.
-  #
-  # ONE KEY AT A TIME. These are stacked deliberately in this order so each row
-  # differs from the row above it in exactly one thing.
-  "diff_v_ablate|--use_diffusion --parameterisation v --generator_norm group --diffusion_offset_noise 0 --min_snr_gamma 0 --ema_decay 0 --diffusion_beta1 0.5 --augment none --diffusion_selection val_loss"
-  "diff_v_ema|--use_diffusion --parameterisation v --generator_norm group --diffusion_offset_noise 0 --min_snr_gamma 0 --diffusion_beta1 0.5 --augment none --diffusion_selection val_loss"
-  "diff_v_snrw|--use_diffusion --parameterisation v --generator_norm group --diffusion_offset_noise 0 --augment none --diffusion_selection val_loss"
-  "diff_v_offset|--use_diffusion --parameterisation v --generator_norm group --augment none --diffusion_selection val_loss"
-  "diff_v_detailsel|--use_diffusion --parameterisation v --generator_norm group --augment none"
-  "diff_v_aug|--use_diffusion --parameterisation v --generator_norm group"
-
-  # The data lever, which is the largest one identified and has never been
-  # exercised: at organ_focus_frac 0 most training patches are body wall, limb
-  # and air, where the correct output IS a copy of the input. Labels are the
-  # contrast organs — aorta 52, IVC 63, portal+splenic vein 64, plus liver 5,
-  # spleen 1, pancreas 7, kidneys 2/3. Confirm against
-  # orgFeatXGB_CTPhase/.../ts_label_map_total.json before trusting the ids.
-  "diff_v_organfocus|--use_diffusion --parameterisation v --generator_norm group --organ_focus_frac 0.5 --organ_focus_labels 52 63 64 5 1 7 2 3"
-
-  # Everything on, plus the organ losses on the predicted x0 (now with
-  # clip=False, so saturated voxels actually contribute a gradient).
-  "diff_v_full|--use_diffusion --parameterisation v --generator_norm group --organ_focus_frac 0.5 --organ_focus_labels 52 63 64 5 1 7 2 3 --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile"
   # add more scenarios here, format: "name|--flag1 --flag2 ..."
 )
 
