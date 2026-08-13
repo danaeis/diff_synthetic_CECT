@@ -399,7 +399,13 @@ class DiffusionTrainer(Trainer):
         [0,1] and the other in [-1,1] would give D a constant offset between the
         two channels that separates nothing and confuses everything.
         """
-        out = {'adv': 0.0, 'fm': 0.0, 'disc': 0.0, 'n_adv': 0}
+        # NaN, not 0.0: these channels mean "not measured on this step". A tight
+        # `adv_max_t` makes the empty-gate case the COMMON one (at adv_max_t=T/10
+        # and batch 8 it is ~43% of steps), and averaging those in as zeros would
+        # scale train_adv by the firing rate and read as a decaying loss. See the
+        # nanmean in `Trainer.train`.
+        nan = float('nan')
+        out = {'adv': nan, 'fm': nan, 'disc': nan, 'n_adv': 0}
 
         # Gate to the low-t half of the schedule (§4b). The SAME subset goes to
         # both D and G, and the same `t` goes to D's real and fake branches, so
@@ -433,12 +439,15 @@ class DiffusionTrainer(Trainer):
         with autocast('cuda', enabled=self.use_amp), self._frozen_d():
             logits, real_f, fake_f = self._disc_verdict(
                 fake_m, real=real_m, source=cond_m, t=t_sel, cond=dcond)
-            if self.use_adv and lam > 0:
-                adv = self.criterion_adv.gen_loss(logits) * lam
+            if self.use_adv:
+                raw = self.criterion_adv.gen_loss(logits)
                 # RAW value, not the lambda-scaled contribution, so `train_adv`
-                # does not change units the moment the warmup finishes.
-                out['adv'] = float(adv.detach()) / lam
-                term = adv
+                # does not change units the moment the warmup finishes — and so
+                # it is still recorded during epoch 0 of the warmup, where the
+                # term is measured but weighted to nothing.
+                out['adv'] = float(raw.detach())
+                if lam > 0:
+                    term = raw * lam
             if self.use_fm:
                 fm = self.fm_loss(real_f or [], fake_f) * self.lambda_fm
                 out['fm'] = float(fm.detach())

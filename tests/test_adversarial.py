@@ -214,12 +214,21 @@ def test_t_gate_and_shared_conditioning():
           bool(seen) and torch.equal(seen[0], t[t < 50]),
           f'{seen[0].tolist() if seen else None} from {t.tolist()}')
 
-    # Nothing below the gate → the term is skipped entirely, not NaN'd.
+    # Nothing below the gate → no term, and the log channels report NaN, which
+    # is this codebase's "not measured" sentinel. Reporting 0.0 would average in
+    # as a measured zero and scale train_adv by the gate's firing rate.
+    import math
     T.global_step = 0
     term, log = T._adversarial_term(src, tgt, x0.detach(),
                                     torch.full((8,), 99), ph, None)
-    check('empty gate skips the term cleanly',
-          term is None and log['n_adv'] == 0 and log['disc'] == 0.0)
+    check('empty gate skips the term and reports NaN, not 0.0',
+          term is None and log['n_adv'] == 0
+          and all(math.isnan(log[k]) for k in ('adv', 'fm', 'disc')))
+
+    # And the epoch mean must then be over the steps that DID fire.
+    vals = [1.0, float('nan'), 3.0]
+    import numpy as np
+    check('nanmean ignores un-measured steps', float(np.nanmean(vals)) == 2.0)
 
 
 def test_lambda_adv_has_one_owner():

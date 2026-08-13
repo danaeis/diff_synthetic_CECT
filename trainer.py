@@ -503,7 +503,10 @@ class Trainer(AdversarialMixin):
         with autocast('cuda', enabled=self.use_amp):
             fake, log_var = self._split_out(self.G(source, phase, level))
 
-        loss_D_val = 0.0
+        # NaN = "not measured this step", so the epoch mean is over the steps D
+        # actually ran on rather than being divided by disc_update_freq. See the
+        # nanmean in `train`.
+        loss_D_val = 0.0 if self.D is None else float('nan')
         if self.D is not None and (self.global_step % self.disc_freq == 0):
             loss_D_val = self._disc_step(target, fake.detach(),
                                          source=source, cond=dcond)
@@ -1120,7 +1123,19 @@ class Trainer(AdversarialMixin):
                     l1=f"{step['l1']:.4f}",
                 )
 
-            avgs = {k: float(np.mean(v)) if v else 0.0 for k, v in accum.items()}
+            # nanmean, not mean. A step reports NaN for a channel it did not
+            # MEASURE, as opposed to 0.0 for one that was measured as zero — the
+            # discriminator only updates every `disc_update_freq` steps, and on
+            # the diffusion path the adversarial term only fires for the items
+            # whose drawn timestep is under `adv_max_t`, which for a tight gate
+            # is most steps. Averaging the un-measured steps in as zeros would
+            # scale those curves by the measured fraction and make `train_adv`
+            # look like it was decaying when only its firing rate changed.
+            # Collapsed back to 0.0 for storage so history.json stays valid JSON.
+            avgs = {}
+            for k, v in accum.items():
+                m = float(np.nanmean(v)) if v and not np.all(np.isnan(v)) else 0.0
+                avgs[k] = 0.0 if m != m else m
 
             if self.sched_G:
                 self.sched_G.step()

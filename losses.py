@@ -671,12 +671,13 @@ class CompositeLoss(nn.Module):
                 raise ValueError("use_adversarial=True requires `adv_weight` — "
                                  "the warmed-up lambda_adv, owned by the trainer")
             _lam_adv = float(adv_weight)
-            adv = self.adv_loss.gen_loss(adv_fake_logits) * _lam_adv
+            raw = self.adv_loss.gen_loss(adv_fake_logits)
             # RAW value, not the lambda-scaled contribution — same rule as L1
-            # above, so `train_adv` does not change units when the warmup ends.
-            d['adversarial'] = float(adv.detach()) / _lam_adv if _lam_adv else 0.0
+            # above, so `train_adv` does not change units when the warmup ends,
+            # and is still recorded while the warmup weight is still 0.
+            d['adversarial'] = float(raw.detach())
             d['lambda_adv'] = _lam_adv
-            total = total + adv
+            total = total + raw * _lam_adv
         else:
             if adv_fake_logits is not None:
                 raise ValueError("`adv_fake_logits` was given but use_adversarial "

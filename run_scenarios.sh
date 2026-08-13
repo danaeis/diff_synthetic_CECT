@@ -71,7 +71,16 @@ SCENARIOS=(
   # are pulling the sampler back toward the conditional mean — which is worth
   # knowing and is exactly what the var-ratio column will show.
   "diff_v_organ|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile"
+  # Adversarial critic on the one-step x0 estimate (DIFFUSION_PLAN.md §11).
+  # RUN THE LAMBDA SWEEP, NOT JUST THE DEFAULT. lambda_adv=2.0 is inherited from
+  # the GAN baseline, where it competed with an L1 term at lambda=100. Here it is
+  # added to a diffusion MSE of order 1e-2..1, so at 2.0 the adversarial term is
+  # the DOMINANT gradient after warmup — a strictly bigger intervention than the
+  # same number was in the baseline. Sweep DOWN first; _lam05 is the one to run
+  # if only one adversarial run is affordable.
   "diff_v_organ_adv|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15"
+  "diff_v_organ_adv_lam05|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5"
+  "diff_v_organ_adv_lam01|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.1"
 
   # No classifier-free guidance. Isolates what the guidance dial costs at
   # training time; a guidance SWEEP is an inference-time flag

@@ -342,6 +342,18 @@ Things a fresh session should know:
   and tested** but not yet run at scale. Scenarios: `b0_groupnorm_adv`,
   `level_aorta`, `level_aorta_pv`, `level_all8`, `slices5_k2`, `slices11_k5`.
 - `splits/levels.json` exists (per-case oracle organ levels, 137 pairs).
+- **Adversarial branch added 2026-08-12** — a discriminator on the diffusion
+  model's one-step x0 estimate, plus the deterministic path. Off by default.
+  **See §11 for what it is, the commands, and its stop conditions.**
+- ⚠ The adversarial rows recorded in `../synthetic_CECT/analysis/benchmark*` were
+  measured with a discriminator that had a BatchNorm real/fake statistics leak, no
+  regularisation, and (for `l1_adv` / `pix2pixhd_baseline`) a confounded λ_l1.
+  The conditional-D runs there are bimodal — `b0_groupnorm_adv` 26.76,
+  `level_aorta` 26.10 and `multiphase_film_adv` 35.01 against a 13.46 baseline,
+  while `level_aorta_pv` 14.81 and `level_all8` 14.43 are fine, n=1 each. Do not
+  cite those as evidence that adversarial training hurts. Every NON-adversarial
+  number, including all of `analysis/BASELINE_REFERENCE.md`, is unaffected — the
+  defects are all gated behind `use_adversarial` / `use_feature_matching`.
 - ⚠ **A run failed on 2026-07-31 because of the working directory.** Launched from
   `arc_synthetic_CECT/synthetic_CECT`, the relative `data_dir`
   (`../sample_data_reg/...`) does not resolve. Run from the directory whose parent
@@ -350,3 +362,159 @@ Things a fresh session should know:
 - ⚠ The output rsync has repeatedly created nested copies
   (`out_synthesis_train/out_synthesis_train/`, and once a clone of the repo inside
   itself). Use an **absolute** destination path.
+
+---
+
+## 11. Adversarial branch — what it is and how to run it
+
+Added 2026-08-12. A discriminator loss on the **one-step x0 estimate** of the
+diffusion model. Code: `models_disc.py`, `trainer_adv.py`,
+`trainer_diffusion.DiffusionTrainer._adversarial_term`, `losses.AdversarialLoss`.
+Off by default; a run without `--use_adversarial` is bit-identical to before.
+
+### What it does, in one paragraph
+
+A diffusion training step produces no image, only a regression target at a random
+noise level, so there is nothing for a critic to judge. Running the sampler inside
+the step would cost 25–1000 U-Net forwards per iteration. Instead the critic is
+given the quantity the organ losses already attach to: the closed-form
+`x0_hat = predict_x0(out, x_t, t)`, which is free because `out` is already
+computed. Per step: one denoiser forward, `x0_hat.detach()` trains D, then D is
+frozen and its verdict on the attached `x0_hat` is added to the diffusion MSE.
+
+Four things make that workable and none are optional:
+
+1. **D is conditioned on `t`**, through its own timestep embedding. `x0_hat`'s
+   sharpness is a monotone function of `t`, so an unconditional critic's cheapest
+   solution is "blurry ⇒ fake" — a timestep regressor — and the only way the
+   generator can beat that is by hallucinating detail at high `t`.
+2. **Gated to `t < adv_max_t`** (default T/2). Above it `x0_hat` is a genuine
+   conditional mean, and "make the mean look like a draw" is a request to be
+   overconfident.
+3. **Straight-through clamp** on `x0_hat` before D sees it: value bounded to
+   [-1,1], gradient passes through. A plain `clamp` would zero the gradient on
+   exactly the saturated voxels that are out of range — the mistake already made
+   once with the organ losses (see `AUX_MAX_T`).
+4. **λ_adv warms up** over `adv_warmup_epochs`. At epoch 1 an `x0_hat` at any
+   moderate `t` is visibly not a CT; D wins immediately and its gradient is noise.
+
+### Known cost, stated in advance
+
+`x0_hat` is the posterior **mean** E[x0|x_t], not a sample. Sharpening a mean
+spends calibration — and calibration is this repo's headline (§7). Expect
+`raps_hf` / `grad_w1` to improve and per-voxel `featHU` / MAE to get *worse*; that
+is the term working, not failing. **The number that decides it is `var_ratio`.**
+If var_ratio falls relative to the non-adversarial twin, the critic is pulling the
+sampler back toward the conditional mean and the term is not worth its cost.
+
+### Commands
+
+Run from the directory whose parent holds `sample_data_reg/` (§10).
+
+```bash
+# 0. Correctness gate. ~30 s, no data, no GPU. Run it before burning GPU time.
+python tests/test_adversarial.py            # expect: ALL PASS
+
+# 1. The comparison twin MUST exist first — an adversarial run alone says nothing.
+./run_scenarios.sh diff_v_organ
+
+# 2. Adversarial, one seed. Start with lambda 0.5, not the 2.0 default.
+./run_scenarios.sh diff_v_organ_adv_lam05
+
+# 3. The rest of the lambda sweep, only if step 2 moved something.
+./run_scenarios.sh diff_v_organ_adv_lam01 diff_v_organ_adv
+
+# 4. Deterministic-baseline counterpart, if you want the GAN-vs-diffusion contrast
+#    on identical code (this is also the clean re-run of synthetic_CECT's
+#    b0_groupnorm_adv, whose recorded featHU of 26.76 was measured with a
+#    defective discriminator).
+./run_scenarios.sh diff_l1_organ_groupnorm diff_l1_organ_groupnorm_adv
+
+# 5. Three seeds, ONLY for a configuration that already moved var_ratio.
+SEEDS="42 43 44" ./run_scenarios.sh diff_v_organ_adv_lam05
+```
+
+Equivalent direct invocation, if you want to change one knob without editing the
+scenario list:
+
+```bash
+python train.py \
+  --output_dir ../out_synthesis_train/literature_baseline_diff_v_organ_adv_lam05 \
+  --seed 42 \
+  --use_diffusion --parameterisation v --generator_norm group \
+  --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile \
+  --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5
+```
+
+### While it trains — the two curves that matter
+
+`history.json` / `curves.png`, top-right panel. `train_adv` (dashed) is the raw
+generator-side GAN loss, `train_disc` (dashed) is D's. **Read them together:**
+
+| pattern | reading |
+|---|---|
+| both hovering, neither → 0 | healthy; the term is doing work |
+| `train_disc` → 0 within a few epochs | D has won. Lower `lr_disc`, or turn on `--lambda_r1 1.0` |
+| `train_adv` → 0, `train_disc` high | G has won; the critic is not constraining anything |
+| `train_adv` spikes then plateaus flat | collapse — stop and lower `--lambda_adv` |
+
+Sanity check the scale once, at any epoch: `train_adv × lambda_adv` should be a
+**minority** of `train_gen_total`. If it is the majority, λ is too high — that is
+the single most likely way this term hurts.
+
+### Evaluating it
+
+```bash
+RUN=../out_synthesis_train/literature_baseline_diff_v_organ_adv_lam05
+
+# a. budget check first — needs run_config.json only, not a checkpoint
+python infer_volume.py --scenario_dir $RUN --dry_run
+
+# b. sample the test split (8 to explore; 20 for the final coverage number)
+python infer_volume.py --scenario_dir $RUN --split test --n_samples 8
+
+# c. pixel + texture metrics, paired against the non-adversarial twin
+python benchmark.py \
+  --weights orgFeatXGB_CTPhase/xgb_vindr_full.pkl \
+  --organ_map orgFeatXGB_CTPhase/retrain_out_full/ts_label_map_total.json \
+  --runs_dir ../out_synthesis_train \
+  --baseline diff_v_organ \
+  --out analysis/benchmark_adv
+
+# d. THE headline: variance ratio and per-organ beta
+python scripts/audit_enhancement.py \
+  --manifest $RUN/phase_infer/manifest.csv \
+  --out analysis/enhancement_diff_v_organ_adv.json
+
+# e. calibration — the cost side of the trade
+python scripts/calibration_eval.py --mode ensemble --dir $RUN/phase_infer
+```
+
+### Stop conditions for this branch specifically
+
+- **`var_ratio` drops vs `diff_v_organ`** → the critic is collapsing the posterior.
+  Report it and stop; do not chase it with more λ.
+- **`raps_hf` does not move toward 1.0 at any λ** → the term is buying nothing that
+  the diffusion objective was not already buying. Drop it.
+- **featHU degrades by more than the 0.84 HU gate *and* var_ratio is flat** → strictly
+  worse on both axes. Stop.
+- **`train_disc` → 0 in under 5 epochs at every λ** → the critic is overfitting the
+  ~137-pair training set. Try `--lambda_r1 1.0 --adv_mode hinge` once; if that does
+  not fix it, the dataset is too small for an adversarial term and that is the
+  finding.
+
+### Knobs
+
+| flag | default | note |
+|---|---|---|
+| `--use_adversarial` | off | the switch |
+| `--lambda_adv` | 2.0 | **sweep down.** Scaled for the GAN baseline, not for a diffusion MSE |
+| `--adv_warmup_epochs` | 10 | linear ramp of λ_adv |
+| `--adv_max_t` | T/2 | timestep gate; below it `x0_hat` is near-deterministic |
+| `--adv_mode` | lsgan | `hinge` degrades more gracefully when D is winning |
+| `--use_cond_disc` | off | D sees `cat([NCCT, image])` — pix2pix's D(x,y). Worth having on |
+| `--lr_disc` | 1e-4 | halve it if D wins too fast |
+| `--lambda_r1` | 0 | lazy R1 on real samples; try 1.0 if `train_disc` collapses |
+| `--disc_norm` | group | `batch` reproduces the reference D's real/fake statistics leak |
+| `--adv_clip_mode` | straight_through | `hard` / `none` exist to be ablated against |
+| `--use_feature_matching` | off | pix2pixHD L1 on D's intermediate features |
