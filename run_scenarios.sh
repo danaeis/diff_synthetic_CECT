@@ -82,6 +82,29 @@ SCENARIOS=(
   "diff_v_organ_adv_lam05|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5"
   "diff_v_organ_adv_lam01|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.1"
 
+  # ── 2.5-D input (DIFFUSION_PLAN.md §11) ────────────────────────────────────
+  # 2k+1 adjacent axial slices as CHANNELS of the conditioning input; the target
+  # is still the centre slice. z is the one geometric deficiency that survived
+  # measurement (config.py N_INPUT_SLICES): patch_depth=1 shows the model 1.5 mm
+  # of an aorta that runs 258 mm. k=2 buys 7.5 mm for ~no extra parameters.
+  #
+  # TWO THINGS BEFORE RUNNING THESE:
+  #  * They REBUILD THE PATCH CACHE. n_input_slices is part of the cache key
+  #    (dataset.py), so the first 2.5-D scenario pays the full preload, and the
+  #    2-D cache stays valid for everything above.
+  #  * RAM scales with n. The source cache is 20k x n x 128 x 128 x f32
+  #    = ~1.3 GB x n (targets and masks do not scale). n=5 is ~6.6 GB, n=11 is
+  #    ~14.4 GB. Lower --max_train_patches if the preload gets OOM-killed.
+  #
+  # The non-adversarial twin comes first — an adversarial 2.5-D run on its own
+  # cannot separate "2.5-D helped" from "the critic helped".
+  "diff_v_organ_slices5|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --n_input_slices 5"
+  "diff_v_organ_adv_slices5|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --n_input_slices 5 --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5"
+
+  # The z-extent sweep. Only worth it if slices5 moved something above the
+  # featHU gate; it is the most expensive row here (cache RAM and preload time).
+  "diff_v_organ_slices11|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --n_input_slices 11"
+
   # No classifier-free guidance. Isolates what the guidance dial costs at
   # training time; a guidance SWEEP is an inference-time flag
   # (infer_volume.py --guidance), not a scenario.

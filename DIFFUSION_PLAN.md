@@ -434,6 +434,45 @@ python tests/test_adversarial.py            # expect: ALL PASS
 SEEDS="42 43 44" ./run_scenarios.sh diff_v_organ_adv_lam05
 ```
 
+### 2.5-D input
+
+Already supported end to end — dataset, U-Net conditioning, CFG null embedding,
+DDIM sampler, tiled inference, augmentation and the discriminator all read
+`n_input_slices`; nothing needed adding for it.
+`tests/test_adversarial.py::test_25d_diffusion_adversarial` pins the three
+separate channel counts that have to agree (`1 + n` into the U-Net, `n` for
+`null_cond`, `1 + n` into a conditional D), because a mismatch there does not
+raise — it just conditions on a truncated stack and trains anyway.
+
+`--n_input_slices` must be **odd**; the target stays the centre slice. The z
+window is edge-clamped so slice 0 and D−1 are still emitted, and the same rule is
+used at train and test time.
+
+```bash
+# non-adversarial twin FIRST — otherwise "2.5-D helped" and "the critic helped"
+# are not separable
+./run_scenarios.sh diff_v_organ_slices5
+./run_scenarios.sh diff_v_organ_adv_slices5
+
+# the z-extent sweep, only if slices5 moved something above the 0.84 HU gate
+./run_scenarios.sh diff_v_organ_slices11
+```
+
+Two operational notes, both of which bite on the first run:
+
+- **The patch cache is rebuilt.** `n_input_slices` is part of the cache key, so
+  the first 2.5-D scenario pays the full preload. The existing 2-D cache stays
+  valid for every other scenario.
+- **Source-cache RAM scales with n.** `MAX_TRAIN_PATCHES × n × 128 × 128 × f32`
+  = ~1.3 GB × n at the default 20k patches (targets and masks do not scale):
+  ~6.6 GB at n=5, ~14.4 GB at n=11, plus ~0.26 GB × n for val. Lower
+  `--max_train_patches` if the preload is OOM-killed.
+
+Reading it: 2.5-D is a *geometry* fix, so the metric to watch is `zflicker` /
+`zaniso` and through-plane coherence, not featHU alone. In `../synthetic_CECT`
+the deterministic `slices11_k5` reached featHU 13.15 against 13.46 — inside the
+0.84 HU gate, i.e. not a result on that axis by itself.
+
 Equivalent direct invocation, if you want to change one knob without editing the
 scenario list:
 
@@ -518,3 +557,4 @@ python scripts/calibration_eval.py --mode ensemble --dir $RUN/phase_infer
 | `--disc_norm` | group | `batch` reproduces the reference D's real/fake statistics leak |
 | `--adv_clip_mode` | straight_through | `hard` / `none` exist to be ablated against |
 | `--use_feature_matching` | off | pix2pixHD L1 on D's intermediate features |
+| `--n_input_slices` | 1 | 2.5-D: odd count of adjacent slices as cond channels. Rebuilds the patch cache |

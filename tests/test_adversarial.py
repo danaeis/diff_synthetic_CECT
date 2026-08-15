@@ -288,6 +288,49 @@ def test_feature_matching_edge_cases():
           float(z) == 0.0 and z.device == f[0].device and z.dtype == f[0].dtype)
 
 
+def test_25d_diffusion_adversarial():
+    """2.5-D input, on the diffusion path, with the critic on.
+
+    Three channel counts have to agree and nothing raises if they do not — the
+    U-Net would just be conditioned on a truncated stack, or D on the wrong
+    pairing, and both still train. `tests/test_level_cond.py::test_25d` covers
+    the deterministic path; this is the combination that has three separate
+    consumers of `in_channels`.
+    """
+    print('\n2.5-D + diffusion + adversarial')
+    n_in = 5
+    T = DiffusionTrainer(_cfg(use_diffusion=True, n_input_slices=n_in,
+                              in_channels=n_in, patch_depth=1, dims=2))
+    T.current_epoch = 5
+    g_in = next(T.G.enc1.parameters()).shape[1]
+    check('U-Net takes 1 noisy + n_input_slices cond channels',
+          g_in == 1 + n_in, f'{g_in} == 1 + {n_in}')
+    check('the CFG null embedding matches the cond width',
+          T.G.null_cond.shape[1] == n_in, str(tuple(T.G.null_cond.shape)))
+    check('conditional D takes 1 + n_input_slices channels',
+          T.D.in_channels == 1 + n_in, f'{T.D.in_channels} == 1 + {n_in}')
+
+    b = _batch(B=8, C=n_in)
+    step = T._train_step(b)
+    check('a 2.5-D adversarial step runs and is finite',
+          step['gen_total'] == step['gen_total'] and step['adv'] == step['adv'],
+          f"total={step['gen_total']:.3f} adv={step['adv']:.3f}")
+
+    # Inference has its own 2.5-D path (edge-clamped slice stacking + tiling);
+    # a shape/finiteness round-trip is what catches a mis-stacked channel axis.
+    from infer_volume import DiffusionPredictor, infer_volume
+    import numpy as np
+    cfg = _cfg(use_diffusion=True, n_input_slices=n_in, in_channels=n_in)
+    vol = np.random.uniform(-50, 150, (7, 32, 32)).astype(np.float32)
+    pred = DiffusionPredictor(T.G.eval(), T.schedule, 'cpu', False, cfg,
+                              ddim_steps=3, phase_id=0, case_id='c0')
+    res = infer_volume(pred, vol, cfg, 'cpu', batch_size=4)[0]
+    check('diffusion inference round-trips a 2.5-D volume',
+          res.shape == vol.shape and bool(np.isfinite(res).all()),
+          f'{vol.shape} -> {res.shape}')
+    T.G.train()
+
+
 def test_modes_and_resume():
     print('\nGAN modes and checkpoint round-trip')
     for mode in ('lsgan', 'bce', 'hinge'):
@@ -331,6 +374,7 @@ if __name__ == '__main__':
     test_lambda_adv_has_one_owner()
     test_flag_off_is_untouched()
     test_feature_matching_edge_cases()
+    test_25d_diffusion_adversarial()
     test_modes_and_resume()
     print('\n' + '=' * 70)
     if FAILS:
