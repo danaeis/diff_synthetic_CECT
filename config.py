@@ -263,6 +263,21 @@ LAMBDA_L1_FLOOR      =  25.0
 LAMBDA_SSIM          =  10.0
 LAMBDA_GRADIENT      =   5.0
 LAMBDA_FREQUENCY     =   1.0
+# Weighting of the FFT-amplitude term. 'raw' | 'banded' | 'focal'.
+#
+# 'raw' is the recorded behaviour and stays the default. It is NOT broken: the
+# intuition that an L1 on raw |FFT| must be dominated by the huge low-frequency
+# amplitudes is wrong, because L1's per-bin gradient is +-1/N regardless of
+# magnitude. Measured against a blurred prediction, 54% of the loss already sits
+# in the top radial band (see losses.FrequencyLoss for the full table).
+#
+# What IS true is milder: DC+very-low is 0.8% of the bins but 4.9% of the loss,
+# i.e. ~6x over-weighted PER BIN. 'banded' multiplies each bin by its radial
+# frequency (normalised to mean 1, so lambda_frequency keeps its scale) to
+# remove that. 'focal' weights each bin by its own detached error instead.
+# Treat both as ablation arms against 'raw', not as fixes.
+FREQUENCY_MODE       = 'raw'
+FREQUENCY_FOCAL_ALPHA=   1.0
 # Raised 5.0 → 20.0 on evidence: at λ=5 the organ term reached only 5% of the L1
 # term early and 21% after the decay completed — a minority of the gradient
 # throughout. The tiered weighting still produced a significant HU improvement at
@@ -281,20 +296,46 @@ LAMBDA_HU_PROFILE    =  50.0
 ORGAN_WEIGHT         =  10.0   # legacy uniform mode, used only when ORGAN_WEIGHTS is None
 
 # ── Adversarial branch ───────────────────────────────────────────────────────
-# 2.0 is the reference GAN baseline's value and is kept so the two are
-# comparable, but note what it means HERE: the diffusion MSE it is added to is
-# of order 1e-2..1, and the LSGAN generator loss is of order 1, so λ=2 makes the
-# adversarial term the DOMINANT gradient once the warmup finishes. That is a
-# strictly bigger intervention than the same number was in the GAN baseline,
-# where it competed with an L1 term at λ=100. Sweep DOWN from here (0.1, 0.5)
-# before sweeping up, and read `train_adv * lambda_adv` against `train_l1` in
-# history.json rather than trusting the number.
-LAMBDA_ADV        =   2.0
+# 0.5, NOT the reference GAN baseline's 2.0, and this is a measured decision
+# rather than a preference. The old comment here reasoned that λ=2.0 "makes the
+# adversarial term the DOMINANT gradient once the warmup finishes" and said to
+# sweep down from it. That sweep was run and it settled the question:
+#
+#   literature_baseline_diff_v_organ_adv       λ=2.0, samples/ep080.png
+#       A regular DIAGONAL HATCHING PATTERN is printed across every output,
+#       including over pure-air background where there is no anatomy to
+#       reconstruct at all — an additive, non-anatomical texture, i.e. G buying
+#       a lower adversarial loss with a pattern that has nothing to do with the
+#       image. PSNR collapsed to 19-22 against 28-30 for the same config with no
+#       critic; SSIM 0.88-0.93 against 0.98.
+#   literature_baseline_diff_v_organ_adv_lam05  λ=0.5, samples/ep090.png
+#       Clean. No hatching. PSNR 22-28.6, SSIM 0.93-0.98.
+#
+# The artifact is λ-dose-dependent and λ >= 2.0 is retired on this path. Keep
+# reading `train_adv * lambda_adv` against the other terms in history.json (now
+# logged directly as `train_adv_contrib`) rather than trusting the raw number.
+#
+# NOTE what BOTH of those runs also showed: `train_disc` sat at ~0.02 with
+# `train_adv` at ~0.95 for 80+ epochs, i.e. D(real)~0.81 / D(fake)~0.03. The
+# discriminator had won outright and G's adversarial gradient was noise for the
+# entire run. λ is not the only thing that was wrong — see LAMBDA_R1 and
+# ADV_MODE below, both of which are now non-default for exactly that reason.
+LAMBDA_ADV        =   0.5
 # pix2pixHD's feature matching. Cheap, and the closest thing to a "free"
 # stabiliser: it is an L1 between D's intermediate activations, so it gives G a
 # dense target even on steps where the adversarial signal has saturated.
 LAMBDA_FM         =  10.0
-ADV_MODE          = 'lsgan'   # 'lsgan' | 'bce' | 'hinge'  (see losses.AdversarialLoss)
+# 'lsgan' | 'bce' | 'hinge'  (see losses.AdversarialLoss)
+#
+# Left at 'lsgan' so the GAN-baseline scenarios stay comparable to the recorded
+# numbers — but on the DIFFUSION path 'hinge' is now set per-scenario, and this
+# is the measured reason. losses.AdversarialLoss's own docstring predicted it:
+# "markedly better behaved when D is winning -- which it always is early in a
+# diffusion run [...] Under LSGAN a saturated D still returns a large gradient
+# that is pure noise to G; the hinge clamps it to zero." Both λ-sweep runs then
+# sat at train_disc~0.02 for 80+ epochs, which is that failure, not a near-miss
+# of it. Set it on the scenario, not here, so the change stays one-per-run.
+ADV_MODE          = 'lsgan'
 # Linear warmup of λ_adv, in epochs. Longer than the baseline's 5 by default on
 # the diffusion path, where an early x0_hat is not a CT at all and D reaches ~0
 # loss within one epoch.
@@ -316,8 +357,21 @@ DISC_SPECTRAL     = True      # spectral norm on every D conv
 USE_COND_DISC     = False
 # Zero-centred gradient penalty on real samples, applied lazily every R1_EVERY
 # D steps and scaled by R1_EVERY so its time-average weight is LAMBDA_R1.
-# 0 = off. Reach for it (try 1.0) when train_disc collapses toward 0 in the first
-# few epochs, which is the expected failure on a few-hundred-volume dataset.
+# 0 = off.
+#
+# THE EXPECTED FAILURE THIS GUARDS AGAINST HAS NOW HAPPENED. The note here used
+# to read "reach for it (try 1.0) when train_disc collapses toward 0 in the first
+# few epochs, which is the expected failure on a few-hundred-volume dataset". It
+# collapsed, in every adversarial diffusion run: train_disc ~0.02 sustained for
+# 80+ epochs with train_adv pinned at ~0.95, i.e. D(real)~0.81 / D(fake)~0.03.
+# Nobody reached for it, because it defaults to off and no scenario set it.
+#
+# Still 0.0 here so the recorded GAN-baseline runs keep their meaning, but every
+# adversarial DIFFUSION scenario now passes --lambda_r1 explicitly. 1.0 is the
+# gentle setting; the stabilised scenario uses 10 because the collapse was not
+# marginal. If train_disc still sits under 0.05 by epoch 20 with R1 on, the
+# problem is D's capacity, not the penalty — reduce DISC_NDF rather than raising
+# this further.
 LAMBDA_R1         =   0.0
 R1_EVERY          =    16
 
@@ -539,6 +593,47 @@ DIFFUSION_VAL_SEED    = 1234
 DIFFUSION_SAMPLE_EVERY = 10
 DIFFUSION_SAMPLE_STEPS = 25
 
+# ── Two knobs that were implemented, CLI-exposed, and never once used ─────────
+# Both were readable only as `--flags` on train.py and had no entry here at all,
+# so `run_config.json` recorded them as absent and no scenario ever set them.
+# They are surfaced now because one of them is aimed squarely at this project's
+# headline failure. Both still default to OFF so every recorded diffusion run
+# keeps its meaning; the new scenarios set them explicitly, one change per run.
+
+# Exponential moving average of the generator weights. 0 disables. Every val
+# pass, every sample grid and the checkpoint's G_state use the averaged weights
+# when it is on (trainer.WeightEMA; live weights stay in G_raw_state so a resume
+# is still exact). Standard practice for diffusion sampling and absent from every
+# run in analysis/benchmark_all — which makes it a live candidate for the sample
+# quality complaints, independent of any loss change. 0.999 is the usual value.
+EMA_DECAY        = 0.0
+
+# Min-SNR loss weighting. 0 disables, and 0 is what every run so far used.
+#
+# READ trainer_diffusion.py:297-304 BEFORE LEAVING THIS AT 0. On this schedule
+# plain v-MSE weights the x0 error at t=0 roughly 24,000x more heavily than at
+# t=999 -- and t=999 is where the case-level HU OFFSET is decided. That offset is
+# the thesis's primary endpoint: measured lev_beta is 0.088 on diff_v and 0.11 on
+# diff_v_organ against a target of 1.0, and var_ratio 0.14 against 1.0. An
+# objective that barely trains the timesteps carrying the level is a mechanical
+# explanation for both numbers, and this flag is the direct intervention on it.
+# 5 is the conventional gamma. Note trainer_diffusion's NoiseSchedule.
+# snr_loss_weight documents why this is NOT the published min-SNR-gamma target.
+MIN_SNR_GAMMA    = 0.0
+
+# Scale-correctness fix for the x0-space auxiliary losses. See
+# trainer_diffusion._diffusion_loss: the organ / HU-profile / SSIM / gradient /
+# frequency terms average over the GATED sub-batch (t < AUX_MAX_T) while the
+# diffusion MSE averages over the WHOLE batch, so their effective weight is
+# inflated by 1/P(t < AUX_MAX_T) ~ 1/0.7 ~ 1.43x and fluctuates batch-to-batch
+# with how many items happen to pass the gate. Turning this on scales each aux
+# term by len(sel)/len(t), putting every term on one per-sample accounting.
+#
+# Default OFF because switching it on changes what every existing lambda MEANS —
+# it is a ~1.43x change in the aux weights, not a bug fix that leaves numbers
+# alone. Run it as a one-flag ablation against its own twin before adopting.
+AUX_GATE_NORMALISE = False
+
 # ── Misc ─────────────────────────────────────────────────────────────────────
 USE_AMP              = True
 KEEP_N_CHECKPOINTS   = 3
@@ -648,6 +743,8 @@ train_config: dict = dict(
     lambda_ssim          = LAMBDA_SSIM,
     lambda_gradient      = LAMBDA_GRADIENT,
     lambda_frequency     = LAMBDA_FREQUENCY,
+    frequency_mode       = FREQUENCY_MODE,
+    frequency_focal_alpha= FREQUENCY_FOCAL_ALPHA,
     lambda_organ         = LAMBDA_ORGAN,
     lambda_hu_profile    = LAMBDA_HU_PROFILE,
     organ_weight         = ORGAN_WEIGHT,
@@ -684,6 +781,9 @@ train_config: dict = dict(
     diffusion_val_seed   = DIFFUSION_VAL_SEED,
     diffusion_sample_every = DIFFUSION_SAMPLE_EVERY,
     diffusion_sample_steps = DIFFUSION_SAMPLE_STEPS,
+    ema_decay            = EMA_DECAY,
+    min_snr_gamma        = MIN_SNR_GAMMA,
+    aux_gate_normalise   = AUX_GATE_NORMALISE,
     # misc
     use_mixed_precision     = USE_AMP,
     keep_last_n_checkpoints = KEEP_N_CHECKPOINTS,

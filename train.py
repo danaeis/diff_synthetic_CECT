@@ -195,11 +195,28 @@ def _parse():
                         'project samples is one degree of freedom that white '
                         'noise barely carries — see models_diffusion.offset_noise.')
     p.add_argument('--min_snr_gamma', type=float, default=None,
-                   help='min-SNR-gamma loss weighting (default 5.0; 0 disables)')
+                   help='min-SNR-gamma loss weighting. Default 0 (OFF) — the help '
+                        'here used to claim 5.0, which was never true of any run. '
+                        'Try 5. Plain v-MSE weights the x0 error at t=0 ~24,000x '
+                        'more than at t=999, and t=999 is where the case-level HU '
+                        'offset is decided; this is the direct intervention on the '
+                        'measured lev_beta ~0.1 / var_ratio ~0.15 failure.')
     p.add_argument('--ema_decay', type=float, default=None,
-                   help='EMA decay for the diffusion weights (default 0.999; '
-                        '0 disables). The averaged weights are what infer_volume '
-                        'loads.')
+                   help='EMA decay for the diffusion weights. Default 0 (OFF) — the '
+                        'help here used to claim 0.999, which was never true of any '
+                        'run in analysis/benchmark_all. Try 0.999. The averaged '
+                        'weights are what infer_volume loads.')
+    g_agn = p.add_mutually_exclusive_group()
+    g_agn.add_argument('--aux_gate_normalise', dest='aux_gate_normalise',
+                       action='store_true', default=None,
+                       help='Scale the x0-space auxiliary losses by len(sel)/len(t) '
+                            'so they share the diffusion MSE per-sample accounting. '
+                            'Without it they average over the t<aux_max_t sub-batch '
+                            'while the MSE averages over the whole batch, inflating '
+                            'their effective weight by ~1/0.7. Changes what every '
+                            'aux lambda means — ablate it, do not assume it.')
+    g_agn.add_argument('--no_aux_gate_normalise', dest='aux_gate_normalise',
+                       action='store_false')
     p.add_argument('--diffusion_beta1', type=float, default=None,
                    help='Adam beta1 on the diffusion path (default 0.9; the '
                         'project-wide 0.5 is a GAN inheritance)')
@@ -219,10 +236,12 @@ def _parse():
                    help='rows in the sample grid (default 4)')
     # ── adversarial branch ──────────────────────────────────────────────────
     p.add_argument('--lambda_adv', type=float, default=None,
-                   help='Generator-side GAN weight after warmup. NOTE the scale: '
-                        'the diffusion MSE it is added to is O(1e-2..1), so the '
-                        'baseline default of 2.0 makes this the dominant term. '
-                        'Sweep downward first.')
+                   help='Generator-side GAN weight after warmup. Default is now '
+                        '0.5, not the GAN baseline 2.0: at 2.0 the diffusion path '
+                        'printed a regular diagonal hatching pattern over every '
+                        'output including pure air, with PSNR 19-22 vs 28-30 '
+                        'uncritiqued (see config.py LAMBDA_ADV). Do not raise this '
+                        'above 1.0 on the diffusion path.')
     p.add_argument('--lambda_fm', type=float, default=None,
                    help='pix2pixHD feature-matching weight (needs --use_feature_matching).')
     p.add_argument('--adv_mode', type=str, default=None,
@@ -254,10 +273,25 @@ def _parse():
                    action='store_false', default=None,
                    help='Drop spectral norm from D.')
     p.add_argument('--lambda_r1', type=float, default=None,
-                   help='Lazy R1 gradient penalty on real samples. 0 = off. Try '
-                        '1.0 when train_disc collapses toward 0 early.')
+                   help='Lazy R1 gradient penalty on real samples. 0 = off, and 0 '
+                        'is what every adversarial run so far used. train_disc DID '
+                        'collapse — it sat at ~0.02 for 80+ epochs on both '
+                        'diffusion runs, meaning D had won outright and G got no '
+                        'usable gradient. Try 1.0, or 10 after a hard collapse.')
     p.add_argument('--r1_every', type=int, default=None)
 
+    p.add_argument('--frequency_mode', type=str, default=None,
+                   choices=['raw', 'banded', 'focal'],
+                   help="weighting of the FFT-amplitude term (needs "
+                        "--use_frequency). 'raw' (default) is the recorded "
+                        "behaviour and already puts ~54%% of its gradient in the "
+                        "top radial band against a blurred prediction; 'banded' "
+                        "removes the ~6x per-bin DC over-weighting; 'focal' "
+                        "weights each bin by its own detached error. NOTE "
+                        "'banded' optimises nearly what metrics.raps_hf_ratio "
+                        "reports, so read raps_hf as a diagnostic on those runs.")
+    p.add_argument('--frequency_focal_alpha', type=float, default=None,
+                   help='exponent on the focal frequency weight (mode=focal)')
     p.add_argument('--lambda_organ',       type=float, default=None)
     p.add_argument('--lambda_hu_profile',  type=float, default=None)
     p.add_argument('--lambda_l1_floor',    type=float, default=None)
@@ -310,6 +344,8 @@ def _apply(cfg: dict, args) -> dict:
               'parameterisation', 'diffusion_steps', 'cfg_drop_prob',
               'aux_max_t', 'diffusion_sample_every', 'diffusion_selection',
               'diffusion_offset_noise', 'min_snr_gamma', 'ema_decay',
+              'aux_gate_normalise',
+              'frequency_mode', 'frequency_focal_alpha',
               'lambda_nll',
               'lambda_adv', 'lambda_fm', 'adv_mode', 'adv_warmup_epochs',
               'adv_max_t', 'adv_clip_mode', 'lr_disc', 'disc_update_freq',

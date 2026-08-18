@@ -42,7 +42,21 @@ SCENARIOS=(
   # if it does not, nothing below is comparable to the recorded baseline and that
   # is the first thing to fix.
   "diff_l1_organ_groupnorm|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group"
-  "diff_l1_organ_groupnorm_adv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group  --use_adversarial --use_cond_disc --adv_warmup_epochs 15"
+  # THIS ROW HAS NEVER PRODUCED A MODEL. Its run directory contains a
+  # run_scenarios.log and nothing else, ending in:
+  #     train.py: error: unrecognized arguments: --use_adversarial
+  #                       --use_cond_disc --adv_warmup_epochs 15
+  # The flags were added to train.py later; the scenario was written against
+  # them first and argparse rejected the whole invocation. run_one DOES report a
+  # non-zero exit, so this was visible in the log and simply never read — which
+  # is why tests/test_scenarios_parse.py now gates every row in this array
+  # against train.py's parser before any GPU time is spent.
+  #
+  # It matters more than a stray failure: DIFFUSION_PLAN.md section 11 calls this
+  # the comparison twin and says it MUST exist before an adversarial diffusion
+  # run means anything ("an adversarial run alone says nothing"). Three
+  # adversarial diffusion runs were then launched without it.
+  "diff_l1_organ_groupnorm_adv|--use_organ --use_per_organ_weights --organ_weight_preset tiered --use_l1_decay --generator_norm group --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5 --adv_mode hinge --lambda_r1 1.0 --use_feature_matching"
 
   # ── Step 2: the calibration baseline diffusion has to beat ─────────────────
   # Same config, plus a (mu, log sigma^2) head and Gaussian NLL instead of L1.
@@ -71,16 +85,56 @@ SCENARIOS=(
   # are pulling the sampler back toward the conditional mean — which is worth
   # knowing and is exactly what the var-ratio column will show.
   "diff_v_organ|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile"
-  # Adversarial critic on the one-step x0 estimate (DIFFUSION_PLAN.md §11).
-  # RUN THE LAMBDA SWEEP, NOT JUST THE DEFAULT. lambda_adv=2.0 is inherited from
-  # the GAN baseline, where it competed with an L1 term at lambda=100. Here it is
-  # added to a diffusion MSE of order 1e-2..1, so at 2.0 the adversarial term is
-  # the DOMINANT gradient after warmup — a strictly bigger intervention than the
-  # same number was in the baseline. Sweep DOWN first; _lam05 is the one to run
-  # if only one adversarial run is affordable.
-  "diff_v_organ_adv|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15"
-  "diff_v_organ_adv_lam05|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5"
-  "diff_v_organ_adv_lam01|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.1"
+  # ── Adversarial critic on the one-step x0 estimate (DIFFUSION_PLAN.md §11) ──
+  #
+  # THE FIRST LAMBDA SWEEP RAN AND FAILED. Read this before adding rows back.
+  #
+  # Three runs went out at lambda_adv 2.0 / 0.5 / 0.5+slices5, all with the
+  # stabilisers left at their defaults. Two things went wrong, and they are
+  # independent:
+  #
+  #  1. THE CRITIC WON AND NEVER STOPPED WINNING. train_disc ~0.02 with
+  #     train_adv ~0.95, sustained past epoch 80 in every run — D(real)~0.81,
+  #     D(fake)~0.03. G's adversarial gradient was noise for the entire run, at
+  #     every lambda. No lambda fixes that, which is why the sweep below is NOT
+  #     a lambda sweep any more.
+  #  2. AT LAMBDA 2.0 IT PRINTED AN ARTIFACT. samples/ep080.png of
+  #     diff_v_organ_adv carries a regular diagonal hatching pattern across every
+  #     output INCLUDING over pure air, with PSNR collapsed to 19-22 (28-30
+  #     without a critic). The lambda 0.5 run at ep090 is clean. lambda >= 2.0 is
+  #     retired on this path; config.py LAMBDA_ADV is now 0.5.
+  #
+  # So the replacement is ONE run that turns on every stabiliser this repo
+  # already implements and never used, rather than three that vary lambda:
+  #   --adv_mode hinge   losses.AdversarialLoss's own docstring: under LSGAN a
+  #                      saturated D still hands G a large gradient that is pure
+  #                      noise; hinge clamps it to zero.
+  #   --lambda_r1 10     trainer_adv's lazy R1. config.py said to reach for this
+  #                      "when train_disc collapses toward 0" — it did, and
+  #                      nobody had. 10, not 1.0, because the collapse was total.
+  #   --disc_update_freq 2 --lr_disc 5e-5   TTUR: D at half the steps and half
+  #                      the LR, so G can keep up.
+  #   --use_feature_matching   config.py calls it "the closest thing to a free
+  #                      stabiliser [...] a dense target even on steps where the
+  #                      adversarial signal has saturated" — exactly this failure.
+  #   --ema_decay 0.999 --min_snr_gamma 5   see the critic-free twin below.
+  #
+  # GATE: check train_disc at epoch 20. Still under 0.05 means D is saturated
+  # again and the answer is less D capacity (--disc_ndf 32), not more lambda.
+  "diff_v_organ_adv_stab|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5 --adv_mode hinge --lambda_r1 10 --r1_every 16 --disc_update_freq 2 --lr_disc 5e-5 --use_feature_matching --ema_decay 0.999 --min_snr_gamma 5"
+
+  # THE CRITIC-FREE TWIN, AND IT IS NOT OPTIONAL. It carries the same two new
+  # diffusion knobs and nothing else, so "EMA + min-SNR helped" and "the critic
+  # helped" stay separable. Both knobs were implemented, CLI-exposed and set to
+  # None in every run in analysis/benchmark_all.
+  #
+  # min_snr_gamma is the pointed one. trainer_diffusion.py:297-304: plain v-MSE
+  # weights the x0 error at t=0 ~24,000x more than at t=999, "and t=999 is where
+  # the case-level HU offset is decided". The measured lev_beta is 0.088 on
+  # diff_v and 0.112 on diff_v_organ against a target of 1.0, var_ratio ~0.14
+  # against 1.0 — an objective that barely trains the timesteps carrying the
+  # level is a mechanical explanation for both. RUN THIS ONE FIRST.
+  "diff_v_organ_ema_snr|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --ema_decay 0.999 --min_snr_gamma 5"
 
   # ── 2.5-D input (DIFFUSION_PLAN.md §11) ────────────────────────────────────
   # 2k+1 adjacent axial slices as CHANNELS of the conditioning input; the target
@@ -99,7 +153,11 @@ SCENARIOS=(
   # The non-adversarial twin comes first — an adversarial 2.5-D run on its own
   # cannot separate "2.5-D helped" from "the critic helped".
   "diff_v_organ_slices5|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --n_input_slices 5"
-  "diff_v_organ_adv_slices5|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --n_input_slices 5 --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5"
+  # Carries the SAME stabiliser set as diff_v_organ_adv_stab — the earlier
+  # version of this row had the bare defaults and hit the same saturated critic.
+  # Do not run it before diff_v_organ_adv_stab has passed its epoch-20 gate;
+  # otherwise "2.5-D helped" and "the critic finally worked" are not separable.
+  "diff_v_organ_adv_slices5|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --n_input_slices 5 --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5 --adv_mode hinge --lambda_r1 10 --r1_every 16 --disc_update_freq 2 --lr_disc 5e-5 --use_feature_matching --ema_decay 0.999 --min_snr_gamma 5"
 
   # The z-extent sweep. Only worth it if slices5 moved something above the
   # featHU gate; it is the most expensive row here (cache RAM and preload time).

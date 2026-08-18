@@ -249,11 +249,76 @@ class GradientLoss(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FrequencyLoss(nn.Module):
+    """L1 on the FFT AMPLITUDE spectrum, in one of three weightings.
+
+    2-D: fft2 over H×W.  3-D: fft2 over H×W per slice, averaged over D.
+
+    WHERE THIS LOSS ACTUALLY PUTS ITS GRADIENT (measured, not assumed)
+    -----------------------------------------------------------------
+    It is tempting to argue that an L1 on raw |FFT| must be dominated by the
+    low-frequency bins, because their amplitudes are ~45x larger per bin, and
+    therefore that the term is just another blur-inducing reconstruction loss.
+    THAT ARGUMENT IS WRONG, and it is worth recording why so nobody re-derives it.
+
+    L1 is not scale-sensitive the way L2 is: d|L1|/d(bin) is +-1/N for every bin
+    regardless of that bin's magnitude. What decides the balance is where the
+    prediction's absolute amplitude ERRORS land. Measured on a synthetic CT-like
+    slice (smooth body + fine grain), as the share of total L1 loss per radial
+    band:
+
+        failure mode            DC+vlow    low     mid    high
+        blurred (5x5 box)          4.9%   10.9%   30.0%   54.2%
+        global +20 HU offset     100.0%    0.0%    0.0%    0.0%
+        organ contrast x1.2       26.6%    4.7%   23.7%   45.0%
+
+    So against BLUR — the failure this term is meant to catch — a majority of the
+    gradient is already in the high band. The term works. What is true, and much
+    milder, is that the DC+very-low band is only 0.8% of the bins while carrying
+    4.9% of the loss, i.e. it is over-weighted ~6x PER BIN relative to uniform.
+    That is a tuning imbalance, not a defect, and `banded` exists to correct it.
+
+    Note the middle row: for a pure level error the loss is entirely a DC term.
+    That is a feature here, not a bug — case-level HU offset is this project's
+    primary endpoint (DIFFUSION_PLAN.md section 2).
+
+    AMPLITUDE ONLY, NOT THE COMPLEX SPECTRUM. Discarding phase makes the term
+    translation-invariant, so it reads edge STATISTICS rather than edge POSITION
+    and is not capped by the residual registration error that limits every
+    per-voxel metric in this project (the same argument metrics.py makes for
+    `grad_hist_distance`). The published Focal Frequency Loss uses the complex
+    difference; `focal` here deliberately does not, because reintroducing phase
+    would reintroduce that ceiling.
+
+    MODES
+      'raw'    (default) uniform weighting. What every existing config means;
+               unchanged so recorded runs stay reproducible.
+      'banded' weight the per-bin difference by radial frequency r, normalised
+               to mean 1 so lambda_frequency keeps its scale. Removes the ~6x
+               per-bin DC over-weighting above and pushes the gradient further
+               into the band `metrics.raps_hf_ratio` reports.
+      'focal'  Focal Frequency Loss (Jiang et al., ICCV 2021) adapted to
+               amplitude: weight each bin by its own DETACHED normalised error to
+               the power alpha, so bins the model is already fitting stop
+               competing for gradient with the ones it is not. Adaptive, and
+               therefore the arm to reach for only if 'banded' shows the axis
+               matters at all.
+
+    CONFOUND, STATE IT IN THE WRITE-UP: 'banded' optimises almost exactly what
+    `metrics.raps_hf_ratio` reports. For runs using it, raps_hf and grad_w1 are
+    DIAGNOSTICS, not evidence; the decision metrics stay featHU, org_mae and the
+    calibration numbers.
     """
-    L1 loss on FFT amplitude spectrum.
-    2-D: fft2 over H×W.
-    3-D: fftn over H×W per slice (spatial frequency target), averaged over D.
-    """
+
+    def __init__(self, mode: str = 'raw', focal_alpha: float = 1.0):
+        super().__init__()
+        if mode not in ('raw', 'banded', 'focal'):
+            raise ValueError(f"unknown frequency_mode {mode!r} — "
+                             f"expected 'raw', 'banded' or 'focal'")
+        self.mode = mode
+        self.focal_alpha = float(focal_alpha)
+        # Radial-frequency weights are per (H, W); cached because the patch size
+        # is fixed for a run and rebuilding them every step is pure overhead.
+        self._wcache = {}
 
     def _amp(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 5:
@@ -262,8 +327,44 @@ class FrequencyLoss(nn.Module):
             return torch.abs(torch.fft.fft2(x2d, norm='ortho'))
         return torch.abs(torch.fft.fft2(x, norm='ortho'))
 
+    def _radial_w(self, h: int, w: int, device, dtype) -> torch.Tensor:
+        """Radial frequency per bin, normalised to mean 1.
+
+        Mean-1 normalisation is what keeps lambda_frequency comparable between
+        modes: without it 'banded' would silently be a ~2x smaller term than
+        'raw' at the same lambda, and the mode ablation would be confounded with
+        a weight change — the exact mistake config.py's LAMBDA_L1 note warns
+        about.
+        """
+        key = (h, w, device, dtype)
+        if key not in self._wcache:
+            fy = torch.fft.fftfreq(h, device=device, dtype=dtype)[:, None]
+            fx = torch.fft.fftfreq(w, device=device, dtype=dtype)[None, :]
+            r = torch.sqrt(fy ** 2 + fx ** 2)
+            self._wcache[key] = r / r.mean().clamp_min(1e-12)
+        return self._wcache[key]
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return F.l1_loss(self._amp(pred), self._amp(target))
+        ap, at = self._amp(pred), self._amp(target)
+        diff = (ap - at).abs()
+
+        if self.mode == 'raw':
+            return diff.mean()
+
+        if self.mode == 'banded':
+            w = self._radial_w(diff.shape[-2], diff.shape[-1],
+                               diff.device, diff.dtype)
+            return (diff * w).mean()
+
+        # focal: per-bin weight from the bin's own error, DETACHED.
+        # Detaching is load-bearing — a live weight would let the model lower the
+        # loss by shrinking the weight instead of the error, which is a
+        # degenerate optimum, and it is what the original paper does too.
+        w = diff.detach()
+        w = w / w.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+        if self.focal_alpha != 1.0:
+            w = w ** self.focal_alpha
+        return (diff * w).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +672,10 @@ class CompositeLoss(nn.Module):
         self.use_freq   = c.get('use_frequency', False)
         self.lambda_freq= c.get('lambda_frequency', 1.0)
         if self.use_freq:
-            self.frequency = FrequencyLoss()
+            self.frequency = FrequencyLoss(
+                mode        = c.get('frequency_mode', 'raw'),
+                focal_alpha = c.get('frequency_focal_alpha', 1.0),
+            )
 
         self.use_organ  = c.get('use_organ', False)
         self.lambda_organ = c.get('lambda_organ', 5.0)
@@ -638,13 +742,34 @@ class CompositeLoss(nn.Module):
         d: Dict[str, float] = {}
         total = pred.new_zeros(1).squeeze()
 
+        # CONTRIBUTION CHANNELS. Every term also records `<name>_contrib` = the
+        # lambda-SCALED value it actually added to `total`.
+        #
+        # This exists because the plain `<name>` entries are NOT in consistent
+        # units and never have been: `l1` and `adversarial` are raw, while
+        # `organ`, `ssim`, `gradient`, `frequency`, `hu_profile`, `nll` and
+        # `feature_matching` are already lambda-scaled. Those units are frozen
+        # here on purpose — changing them would silently redefine every curve in
+        # every recorded history.json — but it makes the one question that
+        # matters for tuning ("what fraction of the gradient is this term?")
+        # unanswerable from the logs. `_contrib / train_gen_total` answers it.
+        def _add(name: str, term, lam: float):
+            """Accumulate `term` (already lambda-scaled) and record both views."""
+            nonlocal total
+            total = total + term
+            v = float(term.detach())
+            d[name] = v
+            d[f'{name}_contrib'] = v
+            return v
+
         if self.use_hetero:
             if log_var is None:
                 raise ValueError("use_hetero=True requires `log_var` — the model's "
                                  "second output channel")
             nll = self.nll(pred, log_var, target) * self.lambda_nll
-            d['nll'] = nll.item();  total = total + nll
+            _add('nll', nll, self.lambda_nll)
             d['l1'] = float(F.l1_loss(pred, target))   # logged, not optimised
+            d['l1_contrib'] = 0.0
             d['lambda_l1'] = 0.0
         else:
             if log_var is not None:
@@ -660,8 +785,10 @@ class CompositeLoss(nn.Module):
             # carries the optimised sum either way.
             d['l1'] = float(l1.detach()) / _lam_l1 if _lam_l1 else 0.0
             total = total + l1
+            d['l1_contrib'] = float(l1.detach())
             d['lambda_l1'] = _lam_l1    # logged so the curriculum is auditable
             d['nll'] = 0.0
+            d['nll_contrib'] = 0.0
 
         if self.use_adv:
             if adv_fake_logits is None:
@@ -678,51 +805,56 @@ class CompositeLoss(nn.Module):
             d['adversarial'] = float(raw.detach())
             d['lambda_adv'] = _lam_adv
             total = total + raw * _lam_adv
+            # The one term whose plain channel is raw AND whose lambda moves
+            # (warmup), so the two views genuinely differ epoch to epoch.
+            d['adversarial_contrib'] = float(raw.detach()) * _lam_adv
         else:
             if adv_fake_logits is not None:
                 raise ValueError("`adv_fake_logits` was given but use_adversarial "
                                  "is False — it would be silently ignored.")
             d['adversarial'] = 0.0
+            d['adversarial_contrib'] = 0.0
             d['lambda_adv'] = 0.0
 
         if self.use_fm:
             if fake_features is None:
                 raise ValueError("use_feature_matching=True requires "
                                  "`fake_features` from the discriminator")
-            fm = self.fm(real_features or [], fake_features) * self.lambda_fm
-            d['feature_matching'] = fm.item();  total = total + fm
+            _add('feature_matching',
+                 self.fm(real_features or [], fake_features) * self.lambda_fm,
+                 self.lambda_fm)
         else:
-            d['feature_matching'] = 0.0
+            d['feature_matching'] = d['feature_matching_contrib'] = 0.0
 
         if self.use_ssim:
-            ssim = self.ssim(pred, target) * self.lambda_ssim
-            d['ssim'] = ssim.item();  total = total + ssim
+            _add('ssim', self.ssim(pred, target) * self.lambda_ssim, self.lambda_ssim)
         else:
-            d['ssim'] = 0.0
+            d['ssim'] = d['ssim_contrib'] = 0.0
 
         if self.use_grad:
-            grad = self.gradient(pred, target) * self.lambda_grad
-            d['gradient'] = grad.item();  total = total + grad
+            _add('gradient', self.gradient(pred, target) * self.lambda_grad,
+                 self.lambda_grad)
         else:
-            d['gradient'] = 0.0
+            d['gradient'] = d['gradient_contrib'] = 0.0
 
         if self.use_freq:
-            freq = self.frequency(pred, target) * self.lambda_freq
-            d['frequency'] = freq.item();  total = total + freq
+            _add('frequency', self.frequency(pred, target) * self.lambda_freq,
+                 self.lambda_freq)
         else:
-            d['frequency'] = 0.0
+            d['frequency'] = d['frequency_contrib'] = 0.0
 
         if self.use_organ:
-            org = self.organ(pred, target, mask) * self.lambda_organ
-            d['organ'] = org.item();  total = total + org
+            _add('organ', self.organ(pred, target, mask) * self.lambda_organ,
+                 self.lambda_organ)
         else:
-            d['organ'] = 0.0
+            d['organ'] = d['organ_contrib'] = 0.0
 
         if self.use_hu_profile:
-            hup = self.hu_profile(pred, target, mask) * self.lambda_hu_profile
-            d['hu_profile'] = hup.item();  total = total + hup
+            _add('hu_profile',
+                 self.hu_profile(pred, target, mask) * self.lambda_hu_profile,
+                 self.lambda_hu_profile)
         else:
-            d['hu_profile'] = 0.0
+            d['hu_profile'] = d['hu_profile_contrib'] = 0.0
 
         d['total'] = total.item()
         return total, d

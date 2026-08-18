@@ -49,6 +49,28 @@ from trainer_adv import AdversarialMixin
 log = logging.getLogger(__name__)
 
 
+# Generator-side loss terms that get a `train_<k>_contrib` history channel.
+#
+# WHY THIS LIST EXISTS. The legacy `train_<k>` channels are NOT in consistent
+# units and cannot be: `train_l1` and `train_adv` hold RAW values while
+# `train_organ`, `train_ssim`, `train_grad`, `train_freq`, `train_hu_profile`,
+# `train_nll` and `train_fm` hold LAMBDA-SCALED ones (see CompositeLoss.forward,
+# which documents why each is the way it is). Those units are frozen — changing
+# them would silently redefine every curve in every history.json already on
+# disk — so the fix is a parallel set of channels that are all scaled, all
+# comparable, and all summing to `train_gen_total`.
+#
+# That makes the question a lambda is actually chosen by — "what fraction of the
+# gradient is this term carrying?" — a division rather than a guess:
+#
+#     share_k = train_<k>_contrib / train_gen_total
+#
+# `disc` is deliberately absent: it is the discriminator's own objective under a
+# different optimiser, not a term in the generator total, so it has no share.
+CONTRIB_TERMS = ('l1', 'nll', 'ssim', 'grad', 'freq',
+                 'organ', 'hu_profile', 'adv', 'fm')
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -384,6 +406,13 @@ class Trainer(AdversarialMixin):
             # both hovering is the healthy one. Constant 0 when the flag is off.
             'train_adv', 'train_fm', 'train_disc', 'lambda_adv',
             'val_loss',
+        ] + [
+            # See CONTRIB_TERMS. One channel per generator-side term holding the
+            # LAMBDA-SCALED value it actually contributed, because the legacy
+            # channels above are a mix of raw and scaled and cannot be compared
+            # with each other. Divide by train_gen_total for the gradient share.
+            f'train_{k}_contrib' for k in CONTRIB_TERMS
+        ] + [
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',              # global
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',  # organ-region
             # Detail/texture, the axis the per-voxel metrics above cannot see. A
@@ -548,6 +577,19 @@ class Trainer(AdversarialMixin):
             'adv':       ld.get('adversarial', 0),
             'fm':        ld.get('feature_matching', 0),
             'disc':      loss_D_val,
+            # Lambda-scaled twins. The short names here differ from
+            # CompositeLoss's long ones (grad/gradient, freq/frequency,
+            # adv/adversarial, fm/feature_matching), so the mapping is spelled
+            # out rather than derived — a silent rename would zero a curve.
+            'l1_contrib':         ld.get('l1_contrib', 0),
+            'nll_contrib':        ld.get('nll_contrib', 0),
+            'ssim_contrib':       ld.get('ssim_contrib', 0),
+            'grad_contrib':       ld.get('gradient_contrib', 0),
+            'freq_contrib':       ld.get('frequency_contrib', 0),
+            'organ_contrib':      ld.get('organ_contrib', 0),
+            'hu_profile_contrib': ld.get('hu_profile_contrib', 0),
+            'adv_contrib':        ld.get('adversarial_contrib', 0),
+            'fm_contrib':         ld.get('feature_matching_contrib', 0),
         }
 
     # -----------------------------------------------------------------------
@@ -921,6 +963,16 @@ class Trainer(AdversarialMixin):
                   'ssim', 'grad', 'freq', 'organ', 'hu_profile',
                   'adv', 'fm', 'disc']:
             h[f'train_{k}'].append(avgs.get(k, 0.0))
+        # Lambda-scaled contributions, recorded next to the legacy channels
+        # rather than replacing them (those units are frozen — see
+        # CompositeLoss.forward). `train_<k>_contrib / train_gen_total` is the
+        # gradient share of term k, which is the number to size a lambda by.
+        # `disc` has none: it is D's own objective, optimised by a different
+        # optimiser, and is not a term in the generator total.
+        for k in CONTRIB_TERMS:
+            key = f'train_{k}_contrib'
+            if key in h:
+                h[key].append(avgs.get(f'{k}_contrib', 0.0))
         for k in ['val_loss',
                   'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
                   'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',
@@ -1085,7 +1137,43 @@ class Trainer(AdversarialMixin):
         ax.set_title(f'Val loss  ({self._selection_label()})')
         _legend(ax); ax.grid(alpha=0.3)
 
-        axes[2, 3].axis('off')
+        # The loss-balance panel. Every OTHER loss panel plots terms in units
+        # that are not comparable to each other (see CONTRIB_TERMS), so none of
+        # them can answer the question a lambda is actually chosen by: what
+        # fraction of the gradient is this term carrying? This one does.
+        #
+        # Read it for two failures that are invisible elsewhere:
+        #   * a band that fills the plot — one term owns the objective and the
+        #     others are decoration. lambda_adv=0.5 against a diffusion MSE of
+        #     order 1e-2 looks exactly like this.
+        #   * a band pinned near zero — that term's lambda is too small to do
+        #     anything, which is what config.py records happening to lambda_organ
+        #     at 5.0 ("reached only 5% of the L1 term early").
+        ax = axes[2, 3]
+        shares, labels = [], []
+        for k in CONTRIB_TERMS:
+            ys = self.history.get(f'train_{k}_contrib')
+            if ys and any(abs(v) > 0 for v in ys):
+                shares.append([abs(float(v)) for v in ys[:len(ep)]])
+                labels.append(k)
+        if shares:
+            # Normalise to the sum of the drawn bands rather than to
+            # train_gen_total: the two agree when every active term is recorded,
+            # and when they disagree the difference is a term this build does not
+            # log, which would otherwise show up as an unexplained white gap.
+            tot = [sum(col) or 1.0 for col in zip(*shares)]
+            frac = [[v / t for v, t in zip(row, tot)] for row in shares]
+            ax.stackplot(ep[:len(frac[0])], *frac, labels=labels, alpha=0.85)
+            ax.set_ylim(0, 1)
+            ax.set_ylabel('share of generator loss')
+            ax.set_title('Loss balance  (lambda-scaled contributions)')
+            _legend(ax)
+        else:
+            ax.text(0.5, 0.5, 'no contribution channels\n(run predates them)',
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=9, alpha=0.5)
+            ax.set_title('Loss balance')
+        ax.grid(alpha=0.3)
 
         plt.tight_layout()
         plt.savefig(self.out / 'curves.png', dpi=120, bbox_inches='tight')
@@ -1111,7 +1199,7 @@ class Trainer(AdversarialMixin):
                 'gen_total', 'l1', 'nll',
                 'ssim', 'grad', 'freq', 'organ', 'hu_profile',
                 'adv', 'fm', 'disc',
-            ]}
+            ] + [f'{k}_contrib' for k in CONTRIB_TERMS]}
 
             pbar = tqdm(train_loader, desc=f'Ep {epoch}/{epochs}', leave=False)
             for batch in pbar:

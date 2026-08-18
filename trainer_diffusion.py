@@ -81,8 +81,8 @@ from torch.utils.data import DataLoader
 from losses import OrganHUProfileLoss, OrganWeightedLoss
 from models_diffusion import (DDIMSampler, build_diffusion, from_model,
                               offset_noise, to_model)
-from trainer import (Trainer, _center_2d, _center_flat, _detail_metric_set,
-                     _metric_set, _METRICS, _MIN_MASK_VOXELS)
+from trainer import (Trainer, CONTRIB_TERMS, _center_2d, _center_flat,
+                     _detail_metric_set, _metric_set, _METRICS, _MIN_MASK_VOXELS)
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +173,22 @@ class DiffusionTrainer(Trainer):
         self.aux_max_t = int(config.get('aux_max_t',
                                         int(0.7 * config.get('diffusion_steps', 1000))))
 
+        # Whether the gated aux terms share the MSE's per-sample accounting.
+        #
+        # THE PROBLEM. `mse` averages over the WHOLE batch. The aux terms average
+        # over the sub-batch that passed `t < aux_max_t` and are then added at
+        # full lambda. So a term whose gate admits 70% of the batch contributes
+        # as if it had been computed on every item — its effective weight is
+        # inflated by 1/0.7 ~ 1.43x — and because |sel| is a fresh binomial draw
+        # each step, that inflation is also NOISY, varying batch to batch.
+        # Nothing about the direction of the gradient is wrong; the scale is.
+        #
+        # Default False so every lambda in config.py keeps the meaning it had
+        # when it was tuned. Switching it on is a ~1.43x change to lambda_organ
+        # and lambda_hu_profile, which is a real intervention and belongs in its
+        # own ablation, not folded silently into another run.
+        self.aux_gate_normalise = bool(config.get('aux_gate_normalise', False))
+
         # Adversarial term on the predicted x0 — see the module docstring, §4.
         # The discriminator itself is built further down, after `use_amp` exists,
         # because its GradScaler needs it.
@@ -243,6 +259,14 @@ class DiffusionTrainer(Trainer):
             'val_mae', 'val_psnr', 'val_ssim', 'val_ncc',
             'val_org_mae', 'val_org_psnr', 'val_org_ssim', 'val_org_ncc',
             'val_raps_hf', 'val_grad_w1', 'val_org_grad_w1', 'val_sampled',
+        ] + [
+            # Same contract as the base trainer — see trainer.CONTRIB_TERMS. On
+            # this path `train_l1_contrib` is the diffusion MSE (no lambda), so
+            # it is the denominator the organ / hu_profile / adv shares are read
+            # against. That ratio is what sizes lambda_organ, and it is the
+            # number that would have shown at a glance that lambda_adv=0.5
+            # against an MSE of order 1e-2 still makes the critic dominant.
+            f'train_{k}_contrib' for k in CONTRIB_TERMS
         ] + [f'gamma_{s}' for s in ('enc1', 'enc2', 'enc3', 'enc4', 'bottleneck',
                                     'dec4', 'dec3', 'dec2', 'dec1')]}
         self._hist_keys = list(self.history)
@@ -261,7 +285,10 @@ class DiffusionTrainer(Trainer):
 
         n_ts = config.get('diffusion_steps', 1000)
         log.info(f"DiffusionTrainer | param={self.param} | T={n_ts} | "
-                 f"aux_max_t={self.aux_max_t} | "
+                 f"aux_max_t={self.aux_max_t}"
+                 f"{' (gate-normalised)' if self.aux_gate_normalise else ''} | "
+                 f"min_snr_gamma={self.min_snr_gamma or 'off'} | "
+                 f"ema={ema_decay or 'off'} | "
                  f"sample every {self.sample_every} ep at {self.sample_steps} DDIM steps")
         log.info(f"Active losses: MSE({self.param})"
                  + (" + organ" if self.use_organ else "")
@@ -307,7 +334,14 @@ class DiffusionTrainer(Trainer):
         else:
             mse = F.mse_loss(out, tgt)
         total = mse
-        d = {'mse': float(mse.detach()), 'organ': 0.0, 'hu_profile': 0.0}
+        # `*_contrib` mirrors CompositeLoss: the lambda-scaled value actually
+        # added to `total`, so "what share of the gradient is this term?" is
+        # answerable from history.json. The diffusion MSE carries no lambda, so
+        # its contrib equals its raw value and it is the denominator everything
+        # else should be read against.
+        d = {'mse': float(mse.detach()), 'mse_contrib': float(mse.detach()),
+             'organ': 0.0, 'organ_contrib': 0.0,
+             'hu_profile': 0.0, 'hu_profile_contrib': 0.0}
 
         # clip=False, unlike the sampler. `predict_x0` defaults to clamping to
         # [-1,1], which is right when the estimate is fed back into the next DDIM
@@ -336,12 +370,19 @@ class DiffusionTrainer(Trainer):
             keep = (t < self.aux_max_t)
             if keep.any():
                 sel = keep.nonzero(as_tuple=True)[0]
+                # See __init__: without this the aux terms average over `sel`
+                # while the MSE averages over the whole batch, so their effective
+                # weight is inflated by 1/P(t < aux_max_t) and jitters with the
+                # binomial draw of |sel|. `gate_w` puts both on per-sample terms.
+                gate_w = (sel.numel() / t.numel()) if self.aux_gate_normalise else 1.0
                 if self.use_organ:
-                    o = self.organ_loss(x0_hat[sel], tgt01[sel], mask[sel]) * self.lambda_organ
-                    d['organ'] = float(o.detach());  total = total + o
+                    o = self.organ_loss(x0_hat[sel], tgt01[sel], mask[sel]) * self.lambda_organ * gate_w
+                    d['organ'] = d['organ_contrib'] = float(o.detach())
+                    total = total + o
                 if self.use_hu_profile:
-                    h = self.hu_profile_loss(x0_hat[sel], tgt01[sel], mask[sel]) * self.lambda_hu_profile
-                    d['hu_profile'] = float(h.detach());  total = total + h
+                    h = self.hu_profile_loss(x0_hat[sel], tgt01[sel], mask[sel]) * self.lambda_hu_profile * gate_w
+                    d['hu_profile'] = d['hu_profile_contrib'] = float(h.detach())
+                    total = total + h
 
         d['total'] = float(total.detach())
         return total, d, x0_hat_m
@@ -446,11 +487,16 @@ class DiffusionTrainer(Trainer):
                 # it is still recorded during epoch 0 of the warmup, where the
                 # term is measured but weighted to nothing.
                 out['adv'] = float(raw.detach())
+                # The scaled view, which is what competes with the diffusion MSE
+                # and the organ terms. Reading `adv` alone is what let a critic
+                # sit at 0.95 for 80 epochs while nobody noticed it was 0.5*0.95
+                # against an MSE of order 1e-2 — i.e. dominant and useless.
+                out['adv_contrib'] = float(raw.detach()) * lam
                 if lam > 0:
                     term = raw * lam
             if self.use_fm:
                 fm = self.fm_loss(real_f or [], fake_f) * self.lambda_fm
-                out['fm'] = float(fm.detach())
+                out['fm'] = out['fm_contrib'] = float(fm.detach())
                 term = fm if term is None else term + fm
         return term, out
 
@@ -506,6 +552,16 @@ class DiffusionTrainer(Trainer):
             'adv':       adv_log['adv'],
             'fm':        adv_log['fm'],
             'disc':      adv_log['disc'],
+            # Lambda-scaled twins. `l1_contrib` is the diffusion MSE, which
+            # carries no lambda — it is the denominator the others are read
+            # against, not a term to tune.
+            'l1_contrib':         d['mse_contrib'],
+            'nll_contrib':        0.0,
+            'ssim_contrib':       0.0, 'grad_contrib': 0.0, 'freq_contrib': 0.0,
+            'organ_contrib':      d['organ_contrib'],
+            'hu_profile_contrib': d['hu_profile_contrib'],
+            'adv_contrib':        adv_log.get('adv_contrib', 0.0),
+            'fm_contrib':         adv_log.get('fm_contrib', 0.0),
         }
 
     # -----------------------------------------------------------------------
