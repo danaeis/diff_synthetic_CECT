@@ -558,3 +558,99 @@ python scripts/calibration_eval.py --mode ensemble --dir $RUN/phase_infer
 | `--adv_clip_mode` | straight_through | `hard` / `none` exist to be ablated against |
 | `--use_feature_matching` | off | pix2pixHD L1 on D's intermediate features |
 | `--n_input_slices` | 1 | 2.5-D: odd count of adjacent slices as cond channels. Rebuilds the patch cache |
+
+## 11a. `adv_stab` post-mortem — the discriminator collapsed the other way
+
+Added 2026-08-21. `diff_v_organ_adv_stab` was the response to §11's own finding
+(baked into `run_scenarios.sh`'s comment above that row): the first lambda sweep
+had D winning outright and never stopping — `train_disc ~0.02`, `train_adv ~0.95`,
+past epoch 80, at every λ. The fix stacked every stabiliser this repo had built
+and never used at once: `--adv_mode hinge --lambda_r1 10 --r1_every 16
+--disc_update_freq 2 --lr_disc 5e-5 --use_feature_matching`.
+
+**It overshot into the opposite failure.** The run (interrupted by hand at epoch
+48/200 — see `../out_synthesis_train/literature_baseline_diff_v_organ_adv_stab/train.log`)
+shows `train_disc` pegged at **exactly 1.0000** from epoch 11 onward, while
+`train_adv` sits near 0 and drifts to ~−0.2 by epoch 45. Under hinge loss,
+`disc_loss = 0.5·(relu(1−real) + relu(1+fake))` equals exactly 1.0 when
+`real ≈ fake ≈ 0` — i.e. D's logits collapsed to a near-constant output for
+every input, real or fake. That is pattern #3 from the table above: *"`train_adv`
+→ 0, `train_disc` high → G has won; the critic is not constraining anything."*
+The samples (`samples/ep040.png`) are visually clean — no hatching — but only
+because the adversarial term had stopped doing anything, not because it was
+calibrated. This is the "discriminator not working its job" failure, and it is
+distinct from — in fact the mirror image of — the one §11 was written to fix.
+
+**Why this matters for reading the run:** the epoch-20 gate `run_scenarios.sh`
+tells you to check ("still under 0.05 → D saturated again, reach for less D
+capacity") only detects the *first* failure direction. `train_disc == 1.0` does
+not fail that check — it is nowhere near 0.05 — so a reader who only watches the
+scalar would call this run healthy. It is not. **`train_disc` alone cannot tell
+"D is discriminating and G is closing the gap" apart from "D is dead,"** because
+both a well-matched real/fake pair near the hinge margin and a collapsed D
+sitting at logit 0 write a `disc` value in the same neighbourhood.
+
+**What changed in response**: `trainer_adv._disc_step` now returns
+`(gan_loss, d_real_mean, d_fake_mean)` — D's raw pre-sigmoid logits, averaged
+over the batch, from the same forward that produced the loss. Threaded through
+to `history.json` as `train_d_real` / `train_d_fake`, the per-epoch log line
+(`D(real)=... D(fake)=...`), and `curves.png`'s "Extra losses" panel. Read them
+together with `train_disc`:
+
+| `d_real` | `d_fake` | reading |
+|---|---|---|
+| ≳ +1 | ≲ −1 | D discriminating, both sides past the hinge margin — healthy |
+| ≈ 0 | ≈ 0 | **D collapsed to a constant** — `adv_stab`'s failure |
+| ≲ −1 | ≳ +1 | D inverted / G has fully won — the critic is dead weight |
+
+**The likely cause, and why it is not a StyleGAN2-style R1 setup**: R1 pulls D's
+gradient on real samples toward zero near the data manifold — that is what it is
+for — but it is normally paired with an *undamped* D (default `lr_disc`, D
+updated every step) so the loss landscape it is flattening still has somewhere
+to go. Here R1 (`λ=10`, 10× the value §11 suggested trying) was combined with
+halving `lr_disc` **and** halving the D update rate in the same run. Any one of
+those three narrows the gap between D and a generator that is also improving
+every step; stacked, on a 97-pair training set, they left D no room to move away
+from its initialisation before the next penalty pass flattened it again.
+Mescheder et al. 2018 ("Which Training Methods for GANs Actually Converge?")
+is the citation for R1 itself; the interaction with a starved update rate on a
+small dataset is not something that paper's default setup exercises, which is
+why isolating the three knobs (next) is the right next step rather than
+adjusting all three together again.
+
+**Next experiment — isolate `lambda_r1` from the other two stabilisers.** No run
+in either sweep has tested R1 alone, at the value §11 originally suggested, with
+D otherwise undamped. Added to `run_scenarios.sh` as `diff_v_organ_adv_r1only`:
+
+```bash
+# 0. Correctness gates first — both cheap, no data, no GPU. Run on whatever
+#    host has torch installed (the training server; this repo's own dev
+#    checkout may not).
+python tests/test_adversarial.py       # expect: ALL PASS
+python tests/test_scenarios_parse.py   # catches an argparse mismatch before
+                                        # it burns GPU time the way §11's
+                                        # first row silently did
+
+# 1. R1=1.0 in isolation: hinge mode (already validated), lambda_r1 at the
+#    ORIGINAL suggested value (not adv_stab's 10x escalation), default
+#    lr_disc, D updated every step. If this collapses too, capacity/update
+#    rate were never the problem and lambda_r1 itself is too strong for this
+#    dataset at both values tried — try 0.1 next, not another stabiliser.
+#    If train_disc instead falls back toward ~0.02-0.05 (the ORIGINAL
+#    failure), R1 alone is not enough and disc_update_freq / lr_disc are
+#    the load-bearing knobs, not R1's magnitude.
+./run_scenarios.sh diff_v_organ_adv_r1only
+
+# 2. Watch it live rather than waiting for a full run: after ~20 epochs,
+grep "Ep  20" ../out_synthesis_train/literature_baseline_diff_v_organ_adv_r1only/train.log
+# Read D(real) / D(fake) alongside disc — see the table above. Stop early if
+# D(real) and D(fake) are both within ~0.1 of each other (collapsed again) or
+# if disc has fallen back under 0.05 (won again) — no need to burn the full
+# 200 epochs to see either failure repeat.
+```
+
+This is a single-variable change from both prior runs (§11's original — R1 off
+entirely — and `adv_stab` — R1 at 10x plus two more knobs moved at once), so
+whichever way it lands, it will say something the existing two runs cannot:
+whether `lambda_r1` itself is the lever, or whether it was innocent and
+`disc_update_freq`/`lr_disc` did the damage in `adv_stab`.

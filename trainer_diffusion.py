@@ -446,7 +446,7 @@ class DiffusionTrainer(Trainer):
         # scale train_adv by the firing rate and read as a decaying loss. See the
         # nanmean in `Trainer.train`.
         nan = float('nan')
-        out = {'adv': nan, 'fm': nan, 'disc': nan, 'n_adv': 0}
+        out = {'adv': nan, 'fm': nan, 'disc': nan, 'd_real': nan, 'd_fake': nan, 'n_adv': 0}
 
         # Gate to the low-t half of the schedule (§4b). The SAME subset goes to
         # both D and G, and the same `t` goes to D's real and fake branches, so
@@ -469,8 +469,8 @@ class DiffusionTrainer(Trainer):
         # under autocast is what the PyTorch AMP docs tell you not to do, and it
         # is easy to get wrong here because the caller is mid-step.
         if self.global_step % self.disc_freq == 0:
-            out['disc'] = self._disc_step(real_m, fake_m.detach(),
-                                          source=cond_m, t=t_sel, cond=dcond)
+            out['disc'], out['d_real'], out['d_fake'] = self._disc_step(
+                real_m, fake_m.detach(), source=cond_m, t=t_sel, cond=dcond)
 
         # D is frozen here: the generator's backward has no business touching
         # D's weights, and leaving it unfrozen would fill D's .grad with
@@ -517,7 +517,7 @@ class DiffusionTrainer(Trainer):
             loss, d, x0_hat_m = self._diffusion_loss(
                 source, target, mask, phase, level, t, noise)
 
-        adv_log = {'adv': 0.0, 'fm': 0.0, 'disc': 0.0}
+        adv_log = {'adv': 0.0, 'fm': 0.0, 'disc': 0.0, 'd_real': 0.0, 'd_fake': 0.0}
         if self.D is not None:
             # ONE denoiser forward per step: `x0_hat_m` above already carries the
             # generator's graph, and `.detach()` inside is what feeds D. The
@@ -552,6 +552,8 @@ class DiffusionTrainer(Trainer):
             'adv':       adv_log['adv'],
             'fm':        adv_log['fm'],
             'disc':      adv_log['disc'],
+            'd_real':    adv_log['d_real'],
+            'd_fake':    adv_log['d_fake'],
             # Lambda-scaled twins. `l1_contrib` is the diffusion MSE, which
             # carries no lambda — it is the denominator the others are read
             # against, not a term to tune.

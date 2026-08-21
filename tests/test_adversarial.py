@@ -223,7 +223,7 @@ def test_t_gate_and_shared_conditioning():
                                     torch.full((8,), 99), ph, None)
     check('empty gate skips the term and reports NaN, not 0.0',
           term is None and log['n_adv'] == 0
-          and all(math.isnan(log[k]) for k in ('adv', 'fm', 'disc')))
+          and all(math.isnan(log[k]) for k in ('adv', 'fm', 'disc', 'd_real', 'd_fake')))
 
     # And the epoch mean must then be over the steps that DID fire.
     vals = [1.0, float('nan'), 3.0]
@@ -273,7 +273,8 @@ def test_flag_off_is_untouched():
     check('generator init is identical with and without D', same)
     step = a._train_step(_batch())
     check('step reports zeroed adversarial channels',
-          step['adv'] == 0 and step['fm'] == 0 and step['disc'] == 0)
+          step['adv'] == 0 and step['fm'] == 0 and step['disc'] == 0
+          and step['d_real'] == 0 and step['d_fake'] == 0)
 
 
 def test_feature_matching_edge_cases():

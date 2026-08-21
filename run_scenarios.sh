@@ -123,6 +123,27 @@ SCENARIOS=(
   # again and the answer is less D capacity (--disc_ndf 32), not more lambda.
   "diff_v_organ_adv_stab|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5 --adv_mode hinge --lambda_r1 10 --r1_every 16 --disc_update_freq 2 --lr_disc 5e-5 --use_feature_matching --ema_decay 0.999 --min_snr_gamma 5"
 
+  # THE GATE ABOVE ONLY CATCHES ONE DIRECTION. diff_v_organ_adv_stab did not
+  # saturate under 0.05 — it pegged train_disc at EXACTLY 1.0000 from epoch 11
+  # on, with train_adv near 0. Under hinge loss that is D's logits collapsed to
+  # ~0 for every input, real or fake: not "D still winning", but "D stopped
+  # discriminating". See DIFFUSION_PLAN.md §11a for the full read and why
+  # train_disc alone cannot tell the two apart (train_d_real / train_d_fake,
+  # added alongside this row, can — read them from curves.png or the per-epoch
+  # log line "D(real)=... D(fake)=...").
+  #
+  # adv_stab changed THREE knobs from the original (all-defaults) failure at
+  # once: lambda_r1 0->10, disc_update_freq 1->2, lr_disc 1e-4->5e-5. This row
+  # changes ONE, back to the value DIFFUSION_PLAN.md §11's knob table originally
+  # suggested trying, with the other two left at their undamped defaults so D
+  # has somewhere to move. If this ALSO collapses, lambda_r1 itself is too
+  # strong at both values tried on 97 pairs and disc_update_freq/lr_disc were
+  # never the problem; if train_disc instead falls back to ~0.02-0.05 (the
+  # ORIGINAL failure direction), R1 alone was never enough and the other two
+  # knobs are load-bearing. Either answer rules something out that neither
+  # prior run can.
+  "diff_v_organ_adv_r1only|--use_diffusion --parameterisation v --generator_norm group --use_organ --use_per_organ_weights --organ_weight_preset tiered --use_hu_profile --use_adversarial --use_cond_disc --adv_warmup_epochs 15 --lambda_adv 0.5 --adv_mode hinge --lambda_r1 1.0 --r1_every 16 --use_feature_matching --ema_decay 0.999 --min_snr_gamma 5"
+
   # THE CRITIC-FREE TWIN, AND IT IS NOT OPTIONAL. It carries the same two new
   # diffusion knobs and nothing else, so "EMA + min-SNR helped" and "the critic
   # helped" stay separable. Both knobs were implemented, CLI-exposed and set to

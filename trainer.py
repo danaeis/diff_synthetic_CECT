@@ -404,7 +404,15 @@ class Trainer(AdversarialMixin):
             # loss. Read them TOGETHER: train_adv falling while train_disc also
             # falls means D is winning and G is not, which is the collapse case;
             # both hovering is the healthy one. Constant 0 when the flag is off.
-            'train_adv', 'train_fm', 'train_disc', 'lambda_adv',
+            # train_d_real / train_d_fake are D's raw logit means (see
+            # _disc_step) and exist to resolve the one thing train_disc cannot:
+            # under hinge loss, "D is confused/inverted" (real << fake) and
+            # "D has collapsed to a constant" (real ~= fake ~= 0) both write
+            # train_disc == 1.0 (its value at the origin) — a healthy but not
+            # yet confident D lands in that same neighbourhood too. The raw
+            # logits tell those apart; the scalar loss does not.
+            'train_adv', 'train_fm', 'train_disc', 'train_d_real', 'train_d_fake',
+            'lambda_adv',
             'val_loss',
         ] + [
             # See CONTRIB_TERMS. One channel per generator-side term holding the
@@ -535,10 +543,10 @@ class Trainer(AdversarialMixin):
         # NaN = "not measured this step", so the epoch mean is over the steps D
         # actually ran on rather than being divided by disc_update_freq. See the
         # nanmean in `train`.
-        loss_D_val = 0.0 if self.D is None else float('nan')
+        loss_D_val = d_real_val = d_fake_val = 0.0 if self.D is None else float('nan')
         if self.D is not None and (self.global_step % self.disc_freq == 0):
-            loss_D_val = self._disc_step(target, fake.detach(),
-                                         source=source, cond=dcond)
+            loss_D_val, d_real_val, d_fake_val = self._disc_step(
+                target, fake.detach(), source=source, cond=dcond)
 
         with autocast('cuda', enabled=self.use_amp):
             adv_logits = real_feats = fake_feats = None
@@ -577,6 +585,8 @@ class Trainer(AdversarialMixin):
             'adv':       ld.get('adversarial', 0),
             'fm':        ld.get('feature_matching', 0),
             'disc':      loss_D_val,
+            'd_real':    d_real_val,
+            'd_fake':    d_fake_val,
             # Lambda-scaled twins. The short names here differ from
             # CompositeLoss's long ones (grad/gradient, freq/frequency,
             # adv/adversarial, fm/feature_matching), so the mapping is spelled
@@ -961,7 +971,7 @@ class Trainer(AdversarialMixin):
         h['lambda_adv'].append(self._adv_w())
         for k in ['gen_total', 'l1', 'nll',
                   'ssim', 'grad', 'freq', 'organ', 'hu_profile',
-                  'adv', 'fm', 'disc']:
+                  'adv', 'fm', 'disc', 'd_real', 'd_fake']:
             h[f'train_{k}'].append(avgs.get(k, 0.0))
         # Lambda-scaled contributions, recorded next to the legacy channels
         # rather than replacing them (those units are frozen — see
@@ -1098,6 +1108,14 @@ class Trainer(AdversarialMixin):
         for k, lbl in [('train_adv','Adv (G)'), ('train_disc','Disc (D)')]:
             if any(v > 0 for v in (self.history.get(k) or [])):
                 ax.plot(ep, self.history[k], ls='--', label=lbl)
+        # D's raw logit means, not just its loss — see _disc_step. Real well
+        # above fake (both past the ±1 hinge margin) is a discriminating D;
+        # both flat near 0 is a dead one; train_disc alone reads the same in
+        # both cases.
+        for k, lbl in [('train_d_real','D(real)'), ('train_d_fake','D(fake)')]:
+            vs = self.history.get(k) or []
+            if any(v != 0 for v in vs):
+                ax.plot(ep, vs, ls=':', label=lbl)
         ax.set_title('Extra losses'); _legend(ax); ax.grid(alpha=0.3)
 
         axes[0, 3].plot(ep, self.history['lr_gen']); axes[0, 3].set_title('LR (gen)')
@@ -1198,7 +1216,7 @@ class Trainer(AdversarialMixin):
             accum: Dict[str, List] = {k: [] for k in [
                 'gen_total', 'l1', 'nll',
                 'ssim', 'grad', 'freq', 'organ', 'hu_profile',
-                'adv', 'fm', 'disc',
+                'adv', 'fm', 'disc', 'd_real', 'd_fake',
             ] + [f'{k}_contrib' for k in CONTRIB_TERMS]}
 
             pbar = tqdm(train_loader, desc=f'Ep {epoch}/{epochs}', leave=False)
@@ -1235,6 +1253,7 @@ class Trainer(AdversarialMixin):
                 f"total={avgs['gen_total']:.4f}  l1={avgs['l1']:.4f}  "
                 f"nll={avgs['nll']:.4f}  organ={avgs['organ']:.4f} | "
                 + (f"adv={avgs['adv']:.4f}  disc={avgs['disc']:.4f}  "
+                   f"D(real)={avgs['d_real']:.2f}  D(fake)={avgs['d_fake']:.2f}  "
                    f"(lam={self._adv_w():.2f}) | " if self.D is not None else "")
                 +
                 f"MAE={val['val_mae']:.4f}  PSNR={val['val_psnr']:.2f}  "

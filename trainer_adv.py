@@ -192,14 +192,26 @@ class AdversarialMixin:
     def _disc_step(self, real: torch.Tensor, fake: torch.Tensor,
                    source: Optional[torch.Tensor] = None,
                    t: Optional[torch.Tensor] = None,
-                   cond: Optional[torch.Tensor] = None) -> float:
+                   cond: Optional[torch.Tensor] = None) -> Tuple[float, float, float]:
         """One discriminator update. `fake` is expected to be already detached.
 
-        Returns the GAN part of D's loss ONLY, never the R1 penalty, even when R1
-        is what was optimised. `train_disc` is read against `train_adv` to tell
-        "D and G are in balance" from "D has won"; folding in a penalty that
-        fires every `r1_every` steps would put a sawtooth through that curve and
-        make the one diagnostic the panel exists for unreadable.
+        Returns `(gan_loss, d_real_mean, d_fake_mean)`. `gan_loss` is the GAN
+        part of D's loss ONLY, never the R1 penalty, even when R1 is what was
+        optimised. `train_disc` is read against `train_adv` to tell "D and G are
+        in balance" from "D has won"; folding in a penalty that fires every
+        `r1_every` steps would put a sawtooth through that curve and make the one
+        diagnostic the panel exists for unreadable.
+
+        `d_real_mean` / `d_fake_mean` are D's raw pre-sigmoid logits, averaged
+        over the batch, from the SAME forward that produced `gan_loss` (i.e.
+        D's state at the START of this step, before the update below). They
+        exist because `gan_loss` alone cannot tell two very different states
+        apart: a healthy adversarial run and a D that has collapsed to a
+        constant both write a `disc` value that a reader has to squint at
+        (hinge disc_loss is 1.0 at BOTH "D outputs ~0 for everything" and at
+        some points along a genuine real/fake split). Real well above fake, both
+        outside the ±1 hinge margin, is D discriminating; both near 0 is D dead.
+        See DIFFUSION_PLAN.md's adversarial-branch section for the read.
 
         `t` and `cond` are passed IDENTICALLY to the real and the fake branch.
         Giving D the timestep for one and not the other, or two different phase
@@ -215,6 +227,9 @@ class AdversarialMixin:
             logits_real, _ = self.D(d_real, t=t, cond=cond)
             logits_fake, _ = self.D(d_fake, t=t, cond=cond)
             gan_loss = self.criterion_adv.disc_loss(logits_real, logits_fake)
+
+        d_real_mean = float(logits_real.detach().float().mean())
+        d_fake_mean = float(logits_fake.detach().float().mean())
 
         loss_D = gan_loss
         if self.lambda_r1 > 0 and (self._d_steps % self.r1_every == 0):
@@ -237,7 +252,7 @@ class AdversarialMixin:
         self.scaler_D.step(self.opt_D)
         self.scaler_D.update()
         self._d_steps += 1
-        return float(gan_loss.detach())
+        return float(gan_loss.detach()), d_real_mean, d_fake_mean
 
     # -----------------------------------------------------------------------
     def _disc_verdict(self, fake: torch.Tensor, real: Optional[torch.Tensor] = None,
